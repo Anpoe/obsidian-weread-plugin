@@ -69,6 +69,11 @@ class ApiRouter {
 		return this.v1Manager.getNotebookHighlights(bookId);
 	}
 
+	/** 阅读器原文接口始终走 V1 Cookie 通道，V2 Agent API 不提供段落结构。 */
+	async getReaderChapterContent(bookId: string, chapterUid: number): Promise<string | undefined> {
+		return this.v1Manager.getReaderChapterContent(bookId, chapterUid);
+	}
+
 	async getNotebookReviews(bookId: string, isArticle = false): Promise<BookReviewResponse | undefined> {
 		// 公众号类型强制使用 V1 接口（依赖 Cookie）
 		if (isArticle) {

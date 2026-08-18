@@ -293,6 +293,7 @@ export class WereadSettingsTab extends PluginSettingTab {
 			this.noteCountLimit();
 		}
 		this.syncPopularHighlightsToggle();
+		this.restoreParagraphBreaks();
 		this.renderSyncModeBookSelection(syncMode);
 	}
 
@@ -495,6 +496,18 @@ export class WereadSettingsTab extends PluginSettingTab {
 					});
 			});
 	}
+
+	private restoreParagraphBreaks(): void {
+		new Setting(this.containerEl)
+			.setName('恢复书摘原文分段')
+			.setDesc('通过微信读书网页版阅读器读取章节原文，尝试恢复被同步接口压成一行的段落；需要扫码登录 Cookie。')
+			.addToggle((toggle) => {
+				return toggle
+					.setValue(get(settingsStore).restoreParagraphBreaks)
+					.onChange((value) => settingsStore.actions.setRestoreParagraphBreaks(value));
+			});
+	}
+
 	private saveReadingInfoToggle(): void {
 		new Setting(this.containerEl)
 			.setName('保存阅读元数据?')

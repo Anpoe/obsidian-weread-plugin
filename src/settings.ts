@@ -80,6 +80,7 @@ export interface WereadPluginSettings {
 	saveArticleToggle: boolean;
 	saveReadingInfoToggle: boolean;
 	syncPopularHighlightsToggle: boolean;
+	restoreParagraphBreaks: boolean;
 	readingOpenMode: ReadingOpenMode;
 	bookOpenMode: BookOpenMode;
 	trimBlocks: boolean;
@@ -138,6 +139,7 @@ const DEFAULT_SETTINGS: WereadPluginSettings = {
 	saveArticleToggle: true,
 	saveReadingInfoToggle: true,
 	syncPopularHighlightsToggle: false,
+	restoreParagraphBreaks: true,
 	readingOpenMode: 'TAB',
 	bookOpenMode: 'web',
 	trimBlocks: false,
@@ -550,6 +552,13 @@ const createSettingsStore = () => {
 		});
 	};
 
+	const setRestoreParagraphBreaks = (value: boolean) => {
+		store.update((state) => {
+			state.restoreParagraphBreaks = value;
+			return state;
+		});
+	};
+
 	const setReadingOpenMode = (readingOpenMode: ReadingOpenMode) => {
 		store.update((state) => {
 			state.readingOpenMode = readingOpenMode;
@@ -785,6 +794,7 @@ const createSettingsStore = () => {
 			setSaveArticleToggle,
 			setSaveReadingInfoToggle,
 			setSyncPopularHighlightsToggle,
+			setRestoreParagraphBreaks,
 			setReadingOpenMode,
 			setBookOpenMode,
 			setCookieCloudInfo,

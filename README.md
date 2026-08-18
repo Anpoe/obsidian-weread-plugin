@@ -92,6 +92,13 @@ Header 区域展示封面、阅读进度、时长、分类、出版社等元数�
 </details>
 
 <details>
+<summary>↩️ 恢复书摘原文分段</summary>
+
+如果微信读书的摘录接口把原书中的多个段落合并成一行，可在设置中开启「恢复书摘原文分段」。插件会使用已登录 Cookie 读取网页版阅读器的章节原文，仅在摘录文本能唯一匹配原文时插入换行；无法匹配时保留接口原文。该功能不适用于公众号内容。
+
+</details>
+
+<details>
 <summary>📅 同步笔记到 Daily Notes</summary>
 	
 1. 在设置中打开同步到Daily Notes的开关，然后分别设置Daily Notes的目录以及文件格式

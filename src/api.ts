@@ -13,8 +13,11 @@ import {
 } from './models';
 import type { ReadingStatsResponse, ReadingStatsMode } from './models';
 import CookieCloudManager from './cookieCloud';
+import { fetchReaderChapterContent, fetchReaderTimestamp } from './readerContent';
 export default class ApiManager {
 	readonly baseUrl: string = 'https://weread.qq.com';
+	private readonly readerTimestampCache = new Map<string, string>();
+	private readonly readerChapterCache = new Map<string, string>();
 
 	private getHeaders() {
 		let cookieString = getCookieString(get(settingsStore).cookies);
@@ -308,6 +311,41 @@ export default class ApiManager {
 			return resp.json;
 		} catch (e) {
 			console.error('get book highlight error' + bookId, e);
+		}
+	}
+
+	/**
+	 * 通过网页版阅读器读取章节原文。该接口只使用 Cookie，不依赖 Agent API Key，
+	 * 用于恢复 bookmarklist 中被压扁的段落结构。
+	 */
+	async getReaderChapterContent(bookId: string, chapterUid: number): Promise<string | undefined> {
+		const cacheKey = `${bookId}:${chapterUid}`;
+		const cached = this.readerChapterCache.get(cacheKey);
+		if (cached) return cached;
+
+		if (get(settingsStore).cookies.length === 0) return undefined;
+
+		try {
+			const headers = this.getHeaders();
+			let psvts = this.readerTimestampCache.get(bookId);
+			if (!psvts) {
+				psvts = await fetchReaderTimestamp(bookId, headers);
+				if (psvts) this.readerTimestampCache.set(bookId, psvts);
+			}
+			if (!psvts) {
+				console.warn(`[weread plugin] 阅读器未返回时间戳: bookId=${bookId}`);
+				return undefined;
+			}
+
+			const content = await fetchReaderChapterContent(bookId, chapterUid, psvts, headers);
+			if (content) this.readerChapterCache.set(cacheKey, content);
+			return content;
+		} catch (error) {
+			console.warn(
+				`[weread plugin] 获取阅读器章节原文失败: bookId=${bookId}, chapterUid=${chapterUid}`,
+				error
+			);
+			return undefined;
 		}
 	}
 

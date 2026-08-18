@@ -9,7 +9,8 @@ import {
 	SyncedNote,
 	SyncLogEntry,
 	PopularChapterHighlight,
-	PopularHighlight
+	PopularHighlight,
+	HighlightResponse
 } from './models';
 import {
 	parseHighlights,
@@ -25,6 +26,7 @@ import { settingsStore } from './settings';
 import { get } from 'svelte/store';
 import { Notice, Vault } from 'obsidian';
 import { createSyncFilterContext, evaluateMetadataSyncFilter } from './syncFilter';
+import { extractReaderParagraphs, restoreParagraphBreaks } from './readerContent';
 export default class SyncNotebooks {
 	private fileManager: FileManager;
 	private apiManager: ApiRouter;
@@ -209,9 +211,13 @@ export default class SyncNotebooks {
 			throw new Error(`书籍"${metaData.title}"数据获取失败`);
 		}
 
-		const highlights = parseHighlights(highlightResp, reviewResp);
+		const highlightRespWithParagraphs =
+			metaData.bookType === 3 || !get(settingsStore).restoreParagraphBreaks
+				? highlightResp
+				: await this.restoreHighlightParagraphs(metaData.bookId, highlightResp);
+		const highlights = parseHighlights(highlightRespWithParagraphs, reviewResp);
 		const reviews = parseReviews(reviewResp);
-		const chapters = parseChapterResp(chapterResp, highlightResp);
+		const chapters = parseChapterResp(chapterResp, highlightRespWithParagraphs);
 		let chapterHighlightReview;
 		if (metaData.bookType === 3) {
 			//公众号文章
@@ -292,6 +298,52 @@ export default class SyncNotebooks {
 			bookReview: bookReview,
 			popularHighlights: popularHighlights
 		};
+	}
+
+	private async restoreHighlightParagraphs(
+		bookId: string,
+		highlightResp: HighlightResponse
+	): Promise<HighlightResponse> {
+		const missing = highlightResp.updated.filter(
+			(highlight) => highlight.markText && !/\r?\n/.test(highlight.markText)
+		);
+		if (missing.length === 0) return highlightResp;
+
+		const byChapter = new Map<number, typeof missing>();
+		for (const highlight of missing) {
+			const items = byChapter.get(highlight.chapterUid) ?? [];
+			items.push(highlight);
+			byChapter.set(highlight.chapterUid, items);
+		}
+
+		let restoredCount = 0;
+		for (const [chapterUid, highlights] of byChapter) {
+			try {
+				const content = await this.apiManager.getReaderChapterContent(bookId, chapterUid);
+				if (!content) continue;
+				const paragraphs = extractReaderParagraphs(content);
+				if (paragraphs.length === 0) continue;
+
+				for (const highlight of highlights) {
+					const restored = restoreParagraphBreaks(highlight.markText, paragraphs);
+					if (!restored) continue;
+					highlight.markText = restored;
+					restoredCount++;
+				}
+			} catch (error) {
+				console.warn(
+					`[weread plugin] 恢复书摘分段失败: bookId=${bookId}, chapterUid=${chapterUid}`,
+					error
+				);
+			}
+		}
+
+		if (restoredCount > 0) {
+			console.log(
+				`[weread plugin] 已通过阅读器原文恢复 ${restoredCount}/${missing.length} 条书摘的段落`
+			);
+		}
+		return highlightResp;
 	}
 
 	/**
