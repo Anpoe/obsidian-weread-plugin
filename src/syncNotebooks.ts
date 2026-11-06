@@ -32,13 +32,14 @@ export default class SyncNotebooks {
 	private apiManager: ApiRouter;
 	private cacheManager: PopularHighlightsCacheManager;
 
-	constructor(fileManager: FileManager, apiManager: ApiRouter, vault: Vault) {
+	constructor(fileManager: FileManager, apiManager: ApiRouter, vault: Vault, private readonly requestLogin?: () => Promise<boolean>) {
 		this.fileManager = fileManager;
 		this.apiManager = apiManager;
 		this.cacheManager = new PopularHighlightsCacheManager(vault);
 	}
 
 	async syncNotebook(noteFile: AnnotationFile) {
+		if (!(await this.ensureParagraphLogin())) return;
 		const metaDataArr: Metadata[] = await this.getALlMetadata();
 		const currentBookMeta = metaDataArr.find((metaData) => metaData.bookId === noteFile.bookId);
 		noteFile.new = true;
@@ -53,6 +54,7 @@ export default class SyncNotebooks {
 	}
 
 	async syncBookById(bookId: string) {
+		if (!(await this.ensureParagraphLogin())) return;
 		const metaDataArr: Metadata[] = await this.getALlMetadata();
 		const localFiles: AnnotationFile[] = await this.fileManager.getNotebookFiles();
 		const duplicateBookSet = this.getDuplicateBooks(metaDataArr);
@@ -77,6 +79,7 @@ export default class SyncNotebooks {
 		journalDate: string,
 		signal?: { cancelled: boolean }
 	): Promise<number> {
+		if (!(await this.ensureParagraphLogin())) throw new Error('同步已取消：请先登录微信读书');
 		const syncStartTime = new Date().getTime();
 		const metaDataArr = await this.getALlMetadata();
 		const filterMetaArr = await this.filterNoteMetas(force, metaDataArr);
@@ -300,6 +303,14 @@ export default class SyncNotebooks {
 		};
 	}
 
+	private async ensureParagraphLogin(): Promise<boolean> {
+		if (!get(settingsStore).restoreParagraphBreaks) return true;
+		if (await this.apiManager.verifyCookieValidity(true)) return true;
+		new Notice('微信读书登录已过期，暂停同步。请扫码登录以保留原文分段。', 10000);
+		if (!this.requestLogin || !(await this.requestLogin())) return false;
+		return this.apiManager.verifyCookieValidity(true);
+	}
+
 	private async restoreHighlightParagraphs(
 		bookId: string,
 		highlightResp: HighlightResponse
@@ -320,7 +331,10 @@ export default class SyncNotebooks {
 		for (const [chapterUid, highlights] of byChapter) {
 			try {
 				const content = await this.apiManager.getReaderChapterContent(bookId, chapterUid);
-				if (!content) continue;
+				if (!content) {
+					new Notice('无法获取章节原文，已停止更新此书以保留分段。请检查 Cookie 登录或网络后重试。', 10000);
+					throw new Error(`章节原文获取失败，保留本地笔记: ${bookId}:${chapterUid}`);
+				}
 				const paragraphs = extractReaderParagraphs(content);
 				if (paragraphs.length === 0) continue;
 
@@ -335,6 +349,7 @@ export default class SyncNotebooks {
 					`[weread plugin] 恢复书摘分段失败: bookId=${bookId}, chapterUid=${chapterUid}`,
 					error
 				);
+				throw error;
 			}
 		}
 

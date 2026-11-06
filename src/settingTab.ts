@@ -73,6 +73,7 @@ export class WereadSettingsTab extends PluginSettingTab {
 		this.fileNameType();
 		this.removeParens();
 		this.filterInlineImages();
+		this.filterAnnotationMarkers();
 		this.subFolderType();
 
 		new Setting(this.containerEl).setName('日记设置').setHeading();
@@ -665,6 +666,19 @@ export class WereadSettingsTab extends PluginSettingTab {
 					);
 				});
 		}
+	}
+
+	private filterAnnotationMarkers(): void {
+		const help = '同步时移除书摘中的 [1]、[18] 等数字注释角标及显示为 OBJ 的对象占位符；保留正文数字、Markdown 链接和双链。现有笔记仅在重新同步时更新。方括号中的普通数字也会被视为角标。';
+		const setting = new Setting(this.containerEl)
+			.setName('过滤注释角标')
+			.addToggle((toggle) => {
+				toggle.setValue(get(settingsStore).filterAnnotationMarkers)
+					.setTooltip(help)
+					.onChange((value) => settingsStore.actions.setFilterAnnotationMarkers(value));
+				toggle.toggleEl.setAttribute('aria-label', `过滤注释角标：${help}`);
+			});
+		setting.nameEl.setAttribute('title', help);
 	}
 
 	private filterInlineImages(): void {

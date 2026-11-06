@@ -281,8 +281,8 @@ class ApiRouter {
 	/**
 	 * 验证 Cookie 有效性（仅 V1 支持）
 	 */
-	async verifyCookieValidity(): Promise<boolean> {
-		return this.v1Manager.verifyCookieValidity();
+	async verifyCookieValidity(strict = false): Promise<boolean> {
+		return this.v1Manager.verifyCookieValidity(strict);
 	}
 
 	/**

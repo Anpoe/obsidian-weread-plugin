@@ -18,6 +18,7 @@ export default class ApiManager {
 	readonly baseUrl: string = 'https://weread.qq.com';
 	private readonly readerTimestampCache = new Map<string, string>();
 	private readonly readerChapterCache = new Map<string, string>();
+	private readerCookieIdentity = '';
 
 	private getHeaders() {
 		let cookieString = getCookieString(get(settingsStore).cookies);
@@ -105,7 +106,7 @@ export default class ApiManager {
 		return isValid;
 	}
 
-	async verifyCookieValidity(): Promise<boolean> {
+	async verifyCookieValidity(strict = false): Promise<boolean> {
 		const cookies = get(settingsStore).cookies;
 		if (!cookies || cookies.length === 0) {
 			console.log('[weread plugin] Cookie 为空，标记无效');
@@ -114,7 +115,10 @@ export default class ApiManager {
 		}
 
 		try {
-			const headers = this.getHeaders();
+			const headers = {
+				...this.getHeaders(),
+				Cookie: cookies.map((cookie) => `${cookie.name}=${encodeURIComponent(cookie.value)}`).join(';')
+			};
 			const req: RequestUrlParam = {
 				url: `${this.baseUrl}/api/user/notebook`,
 				method: 'GET',
@@ -139,7 +143,7 @@ export default class ApiManager {
 				return true;
 			}
 
-			if (resp.json && resp.json.errcode === -2012) {
+			if (resp.json && (resp.json.errcode === -2012 || resp.json.errCode === -2012)) {
 				console.log('[weread plugin] Cookie 超时错误 (-2012)');
 				settingsStore.actions.setIsCookieValid(false);
 				return false;
@@ -158,6 +162,7 @@ export default class ApiManager {
 		}
 
 		// Network error or ambiguous response — preserve current state and log a warning
+		if (strict) throw new Error('无法验证微信读书登录状态，请检查网络后重试；本次未同步');
 		const currentValidity = get(settingsStore).isCookieValid;
 		return currentValidity;
 	}
@@ -319,6 +324,15 @@ export default class ApiManager {
 	 * 用于恢复 bookmarklist 中被压扁的段落结构。
 	 */
 	async getReaderChapterContent(bookId: string, chapterUid: number): Promise<string | undefined> {
+		const cookies = get(settingsStore).cookies;
+		const readerCookie = cookies
+			.map((cookie) => `${cookie.name}=${encodeURIComponent(cookie.value)}`)
+			.join(';');
+		if (readerCookie !== this.readerCookieIdentity) {
+			this.readerTimestampCache.clear();
+			this.readerChapterCache.clear();
+			this.readerCookieIdentity = readerCookie;
+		}
 		const cacheKey = `${bookId}:${chapterUid}`;
 		const cached = this.readerChapterCache.get(cacheKey);
 		if (cached) return cached;
@@ -326,7 +340,7 @@ export default class ApiManager {
 		if (get(settingsStore).cookies.length === 0) return undefined;
 
 		try {
-			const headers = this.getHeaders();
+			const headers = { ...this.getHeaders(), Cookie: readerCookie };
 			let psvts = this.readerTimestampCache.get(bookId);
 			if (!psvts) {
 				psvts = await fetchReaderTimestamp(bookId, headers);
@@ -339,6 +353,7 @@ export default class ApiManager {
 
 			const content = await fetchReaderChapterContent(bookId, chapterUid, psvts, headers);
 			if (content) this.readerChapterCache.set(cacheKey, content);
+			else this.readerTimestampCache.delete(bookId);
 			return content;
 		} catch (error) {
 			console.warn(

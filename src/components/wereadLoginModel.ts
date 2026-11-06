@@ -82,6 +82,13 @@ export default class WereadLoginModel {
 		});
 	}
 
+	async loginAndWait(): Promise<boolean> {
+		const closed = new Promise<void>((resolve) => this.modal.once('closed', resolve));
+		await this.doLogin();
+		await closed;
+		return new ApiManager().verifyCookieValidity(true);
+	}
+
 	async doLogin() {
 		try {
 			await this.modal.loadURL('https://weread.qq.com/#login');

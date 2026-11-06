@@ -71,6 +71,7 @@ export interface WereadPluginSettings {
 	removeParens: boolean;
 	removeParensWhitelist: string;
 	filterInlineImages: boolean;
+	filterAnnotationMarkers: boolean;
 	dailyNotesToggle: boolean;
 	notesBlacklist: string;
 	notesWhitelist: string;
@@ -130,6 +131,7 @@ const DEFAULT_SETTINGS: WereadPluginSettings = {
 	removeParens: false,
 	removeParensWhitelist: '',
 	filterInlineImages: false,
+	filterAnnotationMarkers: false,
 	dailyNotesToggle: false,
 	notesBlacklist: '',
 	notesWhitelist: '',
@@ -488,6 +490,12 @@ const createSettingsStore = () => {
 			return state;
 		});
 	};
+	const setFilterAnnotationMarkers = (value: boolean) => {
+		store.update((state) => {
+			state.filterAnnotationMarkers = value;
+			return state;
+		});
+	};
 
 	const setRemoveParensWhitelist = (whitelist: string) => {
 		store.update((state) => {
@@ -781,6 +789,7 @@ const createSettingsStore = () => {
 			setRemoveParens,
 			setRemoveParensWhitelist,
 			setFilterInlineImages,
+			setFilterAnnotationMarkers,
 			setDailyNotesToggle,
 			setDailyNotesFolder,
 			setDailyNotesFormat,

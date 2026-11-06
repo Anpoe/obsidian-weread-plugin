@@ -1,3 +1,4 @@
+import { removeAnnotationMarkers } from '../utils/annotationMarkers';
 import type {
 	BookReview,
 	BookReviewResponse,
@@ -110,7 +111,10 @@ export const parseHighlights = (
 		const chapterInfo = highlightData.chapters
 			.filter((chapter) => chapter.chapterUid === highlight.chapterUid)
 			.first();
-		const intentMarkText = addIndentToParagraphs(highlight.markText);
+		const sourceText = get(settingsStore).filterAnnotationMarkers
+			? removeAnnotationMarkers(highlight.markText)
+			: highlight.markText;
+		const intentMarkText = addIndentToParagraphs(sourceText);
 		const filterInlineImages = get(settingsStore).filterInlineImages;
 		const markText = filterInlineImages
 			? removeInlineImagePlaceholders(intentMarkText)

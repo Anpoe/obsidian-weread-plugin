@@ -9,6 +9,7 @@ import type { ReadingOpenMode } from './src/settings';
 import { get } from 'svelte/store';
 import { WereadSettingsTab } from './src/settingTab';
 import WereadBrowserWindow from './src/components/wereadBrowserWindow';
+import WereadLoginModel from './src/components/wereadLoginModel';
 import { WEREAD_BROWSER_VIEW_ID, WereadReadingView } from './src/components/wereadReading';
 import { WEREAD_BOOKSHELF_VIEW_ID, WereadBookshelfView } from './src/components/wereadBookshelf';
 import { WEREAD_READING_STATS_VIEW_ID, WereadReadingStatsView } from './src/components/wereadReadingStats';
@@ -34,7 +35,13 @@ export default class WereadPlugin extends Plugin {
 		const fileManager = new FileManager(this.app.vault, this.app.metadataCache, this.app);
 		this.fileManager = fileManager;
 		const apiRouter = new ApiRouter();
-		this.syncNotebooks = new SyncNotebooks(fileManager, apiRouter, this.app.vault);
+		this.syncNotebooks = new SyncNotebooks(fileManager, apiRouter, this.app.vault, async () => {
+			if (!Platform.isDesktopApp) {
+				new Notice('请在桌面端 Weread 设置中扫码登录后重新同步');
+				return false;
+			}
+			return new WereadLoginModel(this.wereadSettingsTab).loginAndWait();
+		});
 		this.bookshelfService = new WereadBookshelfService(fileManager, apiRouter);
 		this.syncReadingStats = new SyncReadingStats(this.app.vault, apiRouter);
 
