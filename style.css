@@ -1431,8 +1431,8 @@
 }
 
 .weread-bookshelf-card-cover-wrap {
-	width: 88px;
-	flex: 0 0 88px;
+	width: 70.4px;
+	flex: 0 0 70.4px;
 }
 
 .weread-bookshelf-card-cover-wrap.is-clickable {
@@ -1441,8 +1441,8 @@
 
 .weread-bookshelf-card-cover,
 .weread-bookshelf-card-cover-placeholder {
-	width: 88px;
-	height: 120px;
+	width: 70.4px;
+	height: 96px;
 	border-radius: 8px;
 	object-fit: cover;
 	background: var(--background-modifier-border);
@@ -1551,6 +1551,97 @@
 	background: var(--interactive-accent-hover);
 	border-color: var(--interactive-accent-hover);
 	color: var(--text-on-accent);
+}
+
+/* ===== 书架纯封面视图 ===== */
+.weread-bookshelf-cover-grid {
+	display: grid;
+	grid-template-columns: repeat(auto-fill, minmax(76.8px, 1fr));
+	gap: 8px;
+}
+
+.weread-bookshelf-cover-card {
+	position: relative;
+	display: flex;
+	flex-direction: column;
+	cursor: pointer;
+	min-width: 0;
+}
+
+.weread-bookshelf-cover-card:has(.weread-bookshelf-cover-card-title) {
+	gap: 6px;
+}
+
+.weread-bookshelf-cover-card:hover {
+	filter: brightness(0.95);
+}
+
+.weread-bookshelf-cover-card-img {
+	width: 100%;
+	aspect-ratio: 3 / 4;
+	object-fit: cover;
+	border-radius: 8px;
+	background: var(--background-modifier-border);
+	box-shadow: 0 2px 6px rgb(0 0 0 / 18%);
+	transition: box-shadow 0.2s ease, transform 0.2s ease;
+}
+
+.weread-bookshelf-cover-card:hover .weread-bookshelf-cover-card-img {
+	box-shadow: 0 4px 12px rgb(0 0 0 / 26%);
+	transform: translateY(-2px);
+}
+
+.weread-bookshelf-cover-card .weread-bookshelf-card-cover-placeholder {
+	width: 100%;
+	height: auto;
+	aspect-ratio: 3 / 4;
+	display: flex;
+	align-items: center;
+	justify-content: center;
+	font-size: 12px;
+	color: var(--text-muted);
+	border-radius: 8px;
+	background: var(--background-modifier-border);
+}
+
+/* 封面下方书名（由设置 bookshelfShowCoverTitle 决定是否渲染） */
+.weread-bookshelf-cover-card-title {
+	font-size: 12px;
+	line-height: 1.4;
+	color: var(--text-muted);
+	white-space: nowrap;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	text-align: center;
+}
+
+.weread-bookshelf-cover-card:hover .weread-bookshelf-cover-card-title {
+	color: var(--text-normal);
+}
+
+/* 封面视图中悬浮操作图标：hover 时才显示在封面右上角 */
+.weread-bookshelf-cover-card .weread-bookshelf-card-top-actions {
+	opacity: 0;
+	transition: opacity 0.2s ease;
+	z-index: 2;
+}
+
+.weread-bookshelf-cover-card:hover .weread-bookshelf-card-top-actions {
+	opacity: 1;
+}
+
+/* 窄屏下封面列数自适应收窄 */
+@container (max-width: 480px) {
+	.weread-bookshelf-cover-grid {
+		grid-template-columns: repeat(auto-fill, minmax(57.6px, 1fr));
+		gap: 6px;
+	}
+}
+
+/* 移动端封面更小，圆角收敛避免占比偏大（Obsidian 移动端根元素带 .is-mobile） */
+.is-mobile .weread-bookshelf-cover-card-img,
+.is-mobile .weread-bookshelf-cover-card .weread-bookshelf-card-cover-placeholder {
+	border-radius: 5px;
 }
 
 /* 窄屏优化：隐藏筛选下拉菜单，显示筛选按钮 */
@@ -2663,6 +2754,7 @@
 
 .weread-ghmap-months {
 	display: flex;
+	gap: 3px; /* same as .weread-ghmap-grid so every label sits exactly above its week column */
 }
 
 .weread-ghmap-monthlabel {
@@ -2672,8 +2764,13 @@
 	height: 16px;
 	line-height: 16px;
 	white-space: nowrap;
-	overflow: hidden;
+	/* One week column wide, but the text may spill into the following (empty) columns:
+	   "10月/11月/12月" are wider than a single column and used to be cropped by
+	   `overflow: hidden`. min-width: 0 keeps every label box exactly one column wide
+	   so labels stay aligned with the grid. */
 	flex: 1;
+	min-width: 0;
+	overflow: visible;
 }
 
 .weread-ghmap-grid {
@@ -3853,6 +3950,15 @@
 	color: var(--text-muted);
 	padding: 40px 0;
 	text-align: center;
+}
+
+.weread-book-detail-local-banner {
+	margin: 8px 0 12px;
+	padding: 8px 12px;
+	border-radius: 8px;
+	background: var(--background-modifier-border);
+	color: var(--text-muted);
+	font-size: 0.85em;
 }
 
 .weread-book-detail-error {

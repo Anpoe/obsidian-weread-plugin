@@ -1,6 +1,7 @@
 import WereadPlugin from '../main';
 import {
 	App,
+	ButtonComponent,
 	ExtraButtonComponent,
 	FuzzySuggestModal,
 	Modal,
@@ -14,16 +15,24 @@ import {
 import type { Metadata } from './models';
 import { parseMetadata } from './parser/parseResponse';
 import { settingsStore } from './settings';
+import type { QuoteShareTemplate } from './quoteShareCard';
 import { get } from 'svelte/store';
 import WereadLoginModel from './components/wereadLoginModel';
 import WereadLogoutModel from './components/wereadLogoutModel';
 import CookieCloudConfigModal from './components/cookieCloudConfigModel';
 import { ThemeManagerModal } from './components/themeManagerModal';
+import { WereadReencounterBooksModal } from './components/wereadReencounterBooksModal';
 
 import ApiRouter from './api-router';
 import { parseBookIdList } from './utils/bookIdUtils';
 import { formatTimestampToDate } from './utils/dateUtil';
-import type { ReadingOpenMode, SyncMode, BookshelfSortMode, BookOpenMode } from './settings';
+import type {
+	ReadingOpenMode,
+	SyncMode,
+	BookshelfSortMode,
+	BookshelfViewMode,
+	BookOpenMode
+} from './settings';
 
 const UNLIMITED_NOTE_COUNT = -1;
 
@@ -191,15 +200,52 @@ export class WereadSettingsTab extends PluginSettingTab {
 			});
 	}
 
+	private favoritesCanvasFolderSetting(): void {
+		let draft = get(settingsStore).favoritesCanvasFolder;
+		let input: TextComponent;
+		const setting = new Setting(this.containerEl).setName('收藏画布保存目录');
+		const describe = () => setting.setDesc(
+			`默认保存在笔记库根目录，留空表示根目录。当前：${this.plugin.favoritesService.getCanvasPath()}。应用时保留原目录；目标目录已有收藏文件时不会覆盖。`
+		);
+		describe();
+		setting.addText((text) => {
+			input = text;
+			return text.setPlaceholder('根目录（默认）或 Books/Weread')
+				.setValue(typeof draft === 'string' ? draft : '')
+				.onChange((value) => { draft = value; });
+		}).addButton((button) => button.setButtonText('选择').onClick(() => {
+			this.createFolderSuggestModal((value) => {
+				draft = value === '/' ? '' : value;
+				input.setValue(draft);
+			}).open();
+		})).addButton((button) => button.setButtonText('应用').onClick(async () => {
+			button.setDisabled(true);
+			input.setDisabled(true);
+			try {
+				await this.plugin.favoritesService.changeCanvasFolder(draft);
+				draft = get(settingsStore).favoritesCanvasFolder;
+				input.setValue(draft);
+				describe();
+				new Notice('收藏画布目录已应用，原文件已保留');
+			} catch (error) {
+				new Notice(error instanceof Error ? error.message : '收藏画布目录更新失败，原目录已保留');
+			} finally {
+				button.setDisabled(false);
+				input.setDisabled(false);
+			}
+		}));
+	}
+
 	private bookOpenModeSetting(): void {
 		new Setting(this.containerEl)
-			.setName('书架阅读入口')
-			.setDesc('点击书架"阅读此书"按钮及详情页阅读链接时，跳转到网页版还是 App')
+			.setName('阅读入口')
+			.setDesc('桌面可选择网页版或 App；移动端 iOS/iPadOS/Android 固定使用 App（deeplink）')
 			.addDropdown((dropdown) => {
 				return dropdown
 					.addOption('web', '网页版')
 					.addOption('app', 'App（deeplink）')
-					.setValue(get(settingsStore).bookOpenMode ?? 'web')
+					.setValue(Platform.isMobile ? 'app' : get(settingsStore).bookOpenMode ?? 'web')
+					.setDisabled(Platform.isMobile)
 					.onChange((value: string) => {
 						settingsStore.actions.setBookOpenMode(value as BookOpenMode);
 					});
@@ -210,13 +256,14 @@ export class WereadSettingsTab extends PluginSettingTab {
 		new Setting(this.containerEl)
 			.setName('网页版打开方式')
 			.setDesc(
-				'控制书架中的”进入网页版”和详情页中的”打开网页版详情”默认在新标签页还是新窗口打开'
+				'仅桌面网页版阅读入口可选择新标签页或新窗口；移动端固定使用 App（deeplink）'
 			)
 			.addDropdown((dropdown) => {
 				return dropdown
 					.addOption('TAB', '新标签页')
 					.addOption('WINDOW', '新窗口')
 					.setValue(get(settingsStore).readingOpenMode)
+					.setDisabled(Platform.isMobile)
 					.onChange((value: string) => {
 						settingsStore.actions.setReadingOpenMode(value as ReadingOpenMode);
 					});
@@ -225,6 +272,66 @@ export class WereadSettingsTab extends PluginSettingTab {
 
 	private bookshelfSettings(): void {
 		new Setting(this.containerEl).setName('书架设置').setHeading();
+		new Setting(this.containerEl)
+			.setName('书架展示模式')
+			.setDesc('默认使用书架模式，展示我的书架中的书籍和文件夹；笔记本模式展示有笔记的书籍及本地笔记。切换后书架页面自动更新。')
+			.addDropdown((dropdown) => dropdown
+				.addOption('bookshelf', '书架模式（默认）')
+				.addOption('notebooks', '笔记本模式')
+				.setValue(get(settingsStore).bookshelfSourceMode ?? 'bookshelf')
+				.onChange((value) => settingsStore.actions.setBookshelfSourceMode(value as 'bookshelf' | 'notebooks')));
+		new Setting(this.containerEl)
+			.setName('收藏默认视图')
+			.setDesc('收藏保存在配置目录的 favorites.canvas，可在收藏页打开原生画布；跨登录保留，不随笔记缓存清理。')
+			.addDropdown((dropdown) => dropdown
+				.addOption('cards', '卡片视图')
+				.addOption('list', '列表视图')
+				.setValue(get(settingsStore).favoritesViewMode ?? 'cards')
+				.onChange((value) => settingsStore.actions.setFavoritesViewMode(value as 'cards' | 'list')));
+		this.favoritesCanvasFolderSetting();
+		new Setting(this.containerEl)
+			.setName('今日与回顾更新频率')
+			.setDesc('首次整理后复用本地缓存；按划线和想法数量校验，仅更新有变化的书。可在页面手动刷新。')
+			.addDropdown((dropdown) => dropdown
+				.addOption('24', '每天一次')
+				.addOption('12', '每天两次')
+				.setValue(String(get(settingsStore).journalRefreshHours))
+				.onChange((value) => settingsStore.actions.setJournalRefreshHours(Number(value))));
+		new Setting(this.containerEl)
+			.setName('旧句重逢包含公众号')
+			.setDesc('仅控制「今日」与「回顾」的旧句重逢是否包含公众号，不影响笔记同步、完整回顾和收藏。')
+			.addToggle((toggle) => toggle
+				.setValue(get(settingsStore).journalIncludeArticles)
+				.onChange((value) => settingsStore.actions.setJournalIncludeArticles(value)));
+		new Setting(this.containerEl)
+			.setName('分享卡片默认模板')
+			.addDropdown((dropdown) => dropdown
+				.addOption('paper', '纸间')
+				.addOption('cover', '书封')
+				.addOption('night', '夜读')
+				.setValue(get(settingsStore).quoteShareTemplate)
+				.onChange((value) => settingsStore.actions.setQuoteShareTemplate(value as QuoteShareTemplate)));
+		new Setting(this.containerEl)
+			.setName('分享署名')
+			.setDesc('用于所有分享卡片，修改后自动保存，重新加载后仍保留；留空使用微信读书用户名，API Key 用户可自填昵称。')
+			.addText((text) => text
+				.setPlaceholder('微信读书用户名')
+				.setValue(get(settingsStore).quoteShareUsername)
+				.onChange(async (value) => {
+					try {
+						await settingsStore.actions.setQuoteShareUsername(value);
+					} catch {
+						new Notice('分享署名保存失败，请重试');
+					}
+				}));
+		new Setting(this.containerEl)
+			.setName('旧句重逢排除书籍')
+			.setDesc('选中的书籍将从「今日」与「回顾」的旧句重逢中排除，仅影响旧句推荐。')
+			.addButton((button) => {
+				const updateText = (ids: string[]) => button.setButtonText(`选择书籍（已排除 ${ids.length} 本）`);
+				updateText(get(settingsStore).journalExcludedBookIds);
+				button.onClick(() => new WereadReencounterBooksModal(this.plugin, updateText).open());
+			});
 			this.readingOpenModeSetting();
 			this.bookOpenModeSetting();
 
@@ -239,6 +346,30 @@ export class WereadSettingsTab extends PluginSettingTab {
 					.setValue(get(settingsStore).bookshelfSortMode)
 					.onChange((value: string) => {
 						settingsStore.actions.setBookshelfSortMode(value as BookshelfSortMode);
+					});
+			});
+
+		new Setting(this.containerEl)
+			.setName('书架默认视图')
+			.setDesc('选择书架默认的列表（封面与详情）或纯封面展示方式')
+			.addDropdown((dropdown) => {
+				return dropdown
+					.addOption('list', '列表（封面+详情）')
+					.addOption('cover', '纯封面')
+					.setValue(get(settingsStore).bookshelfViewMode)
+					.onChange((value: string) => {
+						settingsStore.actions.setBookshelfViewMode(value as BookshelfViewMode);
+					});
+			});
+
+		new Setting(this.containerEl)
+			.setName('封面视图显示书名')
+			.setDesc('在纯封面视图下，是否在封面下方展示书名')
+			.addToggle((toggle) => {
+				return toggle
+					.setValue(get(settingsStore).bookshelfShowCoverTitle)
+					.onChange((value) => {
+						settingsStore.actions.setBookshelfShowCoverTitle(value);
 					});
 			});
 
@@ -397,7 +528,7 @@ export class WereadSettingsTab extends PluginSettingTab {
 		const settings = get(settingsStore);
 		if (
 			this.selectableBooksCache.length > 0 ||
-			this.selectableBooksLoadingPromise
+			this.selectableBooksLoadingPromise !== null
 		) {
 			return;
 		}
@@ -447,11 +578,13 @@ export class WereadSettingsTab extends PluginSettingTab {
 			cls: 'weread-action-button weread-login-btn',
 			text: '登录'
 		});
-		loginBtn.addEventListener('click', async () => {
-			loginBtn.disabled = true;
-			const loginModel = new WereadLoginModel(this);
-			await loginModel.doLogin();
-			this.display();
+		loginBtn.addEventListener('click', () => {
+			void (async () => {
+				loginBtn.disabled = true;
+				const loginModel = new WereadLoginModel(this);
+				await loginModel.doLogin();
+				this.display();
+			})();
 		});
 	}
 
@@ -887,7 +1020,7 @@ export class WereadSettingsTab extends PluginSettingTab {
 		}
 	}
 
-	private async handleScanApiKey(button: any): Promise<void> {
+	private async handleScanApiKey(button: ButtonComponent): Promise<void> {
 		if (!Platform.isDesktopApp) {
 			new Notice('扫码登录仅支持桌面端，请在移动端手动粘贴 API Key');
 			return;

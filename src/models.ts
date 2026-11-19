@@ -1,4 +1,23 @@
 import { TFile } from 'obsidian';
+import type { JournalNote } from './journalHelpers';
+
+export interface FavoriteEntry {
+	id: string;
+	note: JournalNote;
+	favoritedAt: number;
+	updatedAt: number;
+	deletedAt?: number;
+}
+
+export interface FavoritesState {
+	favorites: FavoriteEntry[];
+	loaded: boolean;
+	loading: boolean;
+	writable: boolean;
+	error: string;
+	warning: string;
+	pendingIds: string[];
+}
 
 export interface HighlightResponse {
 	synckey: number;
@@ -479,6 +498,42 @@ export type AnnotationFile = {
 	file: TFile;
 };
 
+export type BookshelfSourceMode = 'bookshelf' | 'notebooks';
+
+export interface ShelfSyncResponse {
+	books: Record<string, any>[];
+	archive?: { name?: string; bookIds?: (string | number)[] }[];
+	albums?: { albumInfo?: Record<string, any>; albumInfoExtra?: Record<string, any> }[];
+	mp?: unknown;
+}
+
+export interface BookshelfFolder {
+	id: string;
+	name: string;
+	bookIds: string[];
+}
+
+export interface BookshelfAlbum {
+	id: string;
+	title: string;
+	author: string;
+	cover?: string;
+	trackCount?: number;
+}
+
+export type ShelfBook = BookshelfBook & {
+	finished?: boolean;
+	countsKnown?: boolean;
+};
+
+export interface BookshelfCollection {
+	books: ShelfBook[];
+	folders: BookshelfFolder[];
+	albums: BookshelfAlbum[];
+	hasArticleCollection: boolean;
+	remoteEntryCount: number;
+}
+
 export type BookshelfProgressState = 'idle' | 'loading' | 'loaded' | 'error';
 
 export type BookshelfProgress = {
@@ -498,6 +553,8 @@ export type BookshelfBook = {
 	title: string;
 	author: string;
 	cover?: string;
+	/** Canonical primary classification from the official bookshelf category. */
+	category?: string;
 	noteCount: number;
 	reviewCount: number;
 	lastReadDate?: string;
@@ -526,6 +583,9 @@ export type SyncLogEntry = {
 	notes: SyncedNote[];
 	success: boolean;
 	errorMessage?: string;
+	failedBooks?: number;
+	cancelled?: boolean;
+	failures?: { bookId: string; title: string; stage: string; errorMessage: string }[];
 };
 
 export type RecentBook = {

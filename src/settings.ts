@@ -6,11 +6,33 @@ import wereadOfficialTemplate from './themes/wereadOfficialTemplate.njk';
 import separatedTemplate from './themes/separatedTemplate.njk';
 import WereadPlugin from '../main';
 import type { SyncLogEntry, Theme } from './models';
+import type { QuoteShareTemplate } from './quoteShareCard';
+
+function normalizeQuoteShareTemplate(value: unknown): QuoteShareTemplate {
+	return value === 'cover' || value === 'night' ? value : 'paper';
+}
+
+function normalizeQuoteShareUsername(value: unknown): string {
+	return typeof value === 'string' ? value.trim() : '';
+}
+
+export function normalizeJournalExcludedBookIds(value: unknown): string[] {
+	if (!Array.isArray(value)) return [];
+	const ids = value.map((id: unknown) =>
+		typeof id === 'string'
+			? id.trim()
+			: typeof id === 'number' && Number.isFinite(id)
+				? String(id)
+				: ''
+	);
+	return [...new Set(ids.filter(Boolean))];
+}
 
 export type SyncMode = 'blacklist' | 'whitelist';
 export type ReadingOpenMode = 'TAB' | 'WINDOW';
 export type BookOpenMode = 'web' | 'app';
 export type BookshelfSortMode = 'recent' | 'title';
+export type BookshelfViewMode = 'list' | 'cover';
 export type SyncStatusFilter = 'all' | 'remoteOnly' | 'synced' | 'localOnly';
 
 type LegacyWereadPluginSettings = Partial<WereadPluginSettings> & {
@@ -98,7 +120,18 @@ export interface WereadPluginSettings {
 	lastSyncBookCount: number;
 	lastSyncBookTitles: string[];
 	syncLogs: SyncLogEntry[];
+	bookshelfSourceMode: 'bookshelf' | 'notebooks';
+	journalRefreshHours: number;
+	journalExcludedBookIds: string[];
+	journalIncludeArticles: boolean;
+	quoteShareTemplate: QuoteShareTemplate;
+	quoteShareUsername: string;
+	favoritesViewMode: 'cards' | 'list';
+	favoritesCanvasFolder: string;
+	favoritesCanvasLocationVersion: 0 | 1;
 	bookshelfSortMode: BookshelfSortMode;
+	bookshelfViewMode: BookshelfViewMode;
+	bookshelfShowCoverTitle: boolean;
 	bookshelfGroupByYear: boolean;
 	bookshelfDefaultSyncStatusFilter: SyncStatusFilter;
 	themes: Theme[];
@@ -158,7 +191,18 @@ const DEFAULT_SETTINGS: WereadPluginSettings = {
 	lastSyncBookCount: 0,
 	lastSyncBookTitles: [],
 	syncLogs: [],
+	bookshelfSourceMode: 'bookshelf',
+	journalRefreshHours: 24,
+	journalExcludedBookIds: [],
+	journalIncludeArticles: true,
+	quoteShareTemplate: 'paper',
+	quoteShareUsername: '',
+	favoritesViewMode: 'cards',
+	favoritesCanvasFolder: '',
+	favoritesCanvasLocationVersion: 0,
 	bookshelfSortMode: 'recent',
+	bookshelfViewMode: 'list',
+	bookshelfShowCoverTitle: true,
 	bookshelfGroupByYear: true,
 	bookshelfDefaultSyncStatusFilter: 'all',
 	themes: BUILT_IN_THEMES,
@@ -174,6 +218,17 @@ const createSettingsStore = () => {
 	const store = writable(DEFAULT_SETTINGS as WereadPluginSettings);
 
 	let _plugin!: WereadPlugin;
+	let persistence: Promise<void> | undefined;
+	let lastSaveOperation: Promise<void> | undefined;
+	let publishingLocation = false;
+	const enqueueSave = (save: () => Promise<void>): Promise<void> => {
+		const operation =
+			persistence !== undefined ? persistence.then(save, save) : save();
+		const settled = operation.catch((): void => undefined);
+		persistence = settled;
+		void settled.then(() => { if (persistence === settled) persistence = undefined; });
+		return operation;
+	};
 
 	const initialise = async (plugin: WereadPlugin): Promise<void> => {
 		const loadedData = await plugin.loadData();
@@ -185,6 +240,13 @@ const createSettingsStore = () => {
 		const { manualSyncMode, ...restData } = data;
 		const settings: WereadPluginSettings = {
 			...restData,
+			quoteShareTemplate: normalizeQuoteShareTemplate(data.quoteShareTemplate),
+			quoteShareUsername: normalizeQuoteShareUsername(data.quoteShareUsername),
+			journalExcludedBookIds: normalizeJournalExcludedBookIds(data.journalExcludedBookIds),
+			journalIncludeArticles:
+				typeof rawData.journalIncludeArticles === 'boolean'
+					? rawData.journalIncludeArticles
+					: DEFAULT_SETTINGS.journalIncludeArticles,
 			syncMode:
 				data.syncMode === 'blacklist' || data.syncMode === 'whitelist'
 					? data.syncMode
@@ -303,16 +365,31 @@ const createSettingsStore = () => {
 
 		_plugin = plugin;
 		store.set(settings);
+		await persistence;
 	};
 
-	store.subscribe(async (settings) => {
-		if (_plugin) {
-			const data = {
-				...settings
-			};
-			await _plugin.saveData(data);
+	store.subscribe((settings) => {
+		if (_plugin && !publishingLocation) {
+			const data = { ...settings };
+			lastSaveOperation = enqueueSave(() => _plugin.saveData({
+				...data,
+				favoritesCanvasFolder: get(store).favoritesCanvasFolder,
+				favoritesCanvasLocationVersion: get(store).favoritesCanvasLocationVersion
+			}));
+			void lastSaveOperation.catch(() => console.error('[weread plugin] 设置保存失败'));
 		}
 	});
+
+	const commitFavoritesCanvasLocation = (folder: string, version: 1): Promise<void> =>
+		enqueueSave(async () => {
+			if (!_plugin) throw new Error('收藏设置尚未加载');
+			const next = { ...get(store), favoritesCanvasFolder: folder, favoritesCanvasLocationVersion: version };
+			await _plugin.saveData(next);
+			publishingLocation = true;
+			try {
+				store.update((current) => ({ ...current, favoritesCanvasFolder: folder, favoritesCanvasLocationVersion: version }));
+			} finally { publishingLocation = false; }
+		});
 
 	const setLoginMethod = (method: string) => {
 		store.update((settings) => {
@@ -640,9 +717,23 @@ const createSettingsStore = () => {
 		});
 	};
 
+	const setBookshelfViewMode = (viewMode: BookshelfViewMode) => {
+		store.update((state) => {
+			state.bookshelfViewMode = viewMode;
+			return state;
+		});
+	};
+
 	const setBookshelfGroupByYear = (groupByYear: boolean) => {
 		store.update((state) => {
 			state.bookshelfGroupByYear = groupByYear;
+			return state;
+		});
+	};
+
+	const setBookshelfShowCoverTitle = (show: boolean) => {
+		store.update((state) => {
+			state.bookshelfShowCoverTitle = show;
 			return state;
 		});
 	};
@@ -772,10 +863,52 @@ const createSettingsStore = () => {
 		});
 	};
 
+	const setBookshelfSourceMode = (mode: 'bookshelf' | 'notebooks') => {
+		store.update((state) => ({ ...state, bookshelfSourceMode: mode }));
+	};
+
+	const setJournalRefreshHours = (hours: number) => {
+		store.update((state) => ({ ...state, journalRefreshHours: hours === 12 ? 12 : 24 }));
+	};
+
+	const setJournalExcludedBookIds = (ids: unknown) => {
+		store.update((state) => ({
+			...state,
+			journalExcludedBookIds: normalizeJournalExcludedBookIds(ids)
+		}));
+	};
+
+	const setJournalIncludeArticles = (value: boolean) => {
+		store.update((state) => ({ ...state, journalIncludeArticles: value }));
+	};
+
+	const setQuoteShareTemplate = (value: QuoteShareTemplate) => {
+		store.update((state) => ({ ...state, quoteShareTemplate: normalizeQuoteShareTemplate(value) }));
+	};
+
+	const setQuoteShareUsername = (value: string): Promise<void> => {
+		if (!_plugin) return Promise.reject(new Error('分享署名设置尚未加载'));
+		store.update((state) => ({ ...state, quoteShareUsername: normalizeQuoteShareUsername(value) }));
+		// Svelte subscribers run synchronously; return this update's actual save, not the settled queue.
+		return lastSaveOperation!;
+	};
+
+	const setFavoritesViewMode = (mode: 'cards' | 'list') => {
+		store.update((state) => ({ ...state, favoritesViewMode: mode === 'list' ? 'list' : 'cards' }));
+	};
+
 	return {
 		subscribe: store.subscribe,
 		initialise,
 		actions: {
+			commitFavoritesCanvasLocation,
+			setFavoritesViewMode,
+			setBookshelfSourceMode,
+			setJournalRefreshHours,
+			setJournalExcludedBookIds,
+			setJournalIncludeArticles,
+			setQuoteShareTemplate,
+			setQuoteShareUsername,
 			setLoginMethod,
 			setNoteLocationFolder,
 			setCookies,
@@ -815,6 +948,8 @@ const createSettingsStore = () => {
 			addSyncLog,
 			getSyncLogs,
 			setBookshelfSortMode,
+			setBookshelfShowCoverTitle,
+			setBookshelfViewMode,
 			setBookshelfGroupByYear,
 			setBookshelfDefaultSyncStatusFilter,
 			setActiveTheme,

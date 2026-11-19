@@ -17,11 +17,9 @@ import type {
 	Review
 } from '../models';
 import { NodeHtmlMarkdown } from 'node-html-markdown';
+import * as CryptoJS from 'crypto-js';
 import { settingsStore } from '../settings';
 import { get } from 'svelte/store';
-import { getPcUrl } from '../readerContent';
-
-export { getPcUrl };
 
 export const parsePopularHighlights = (resp: {
 	items: {
@@ -86,7 +84,7 @@ export const parseMetadata = (noteBook: any): Metadata => {
 };
 
 const convertTagToBiLink = (review: string) => {
-	return review.replace(/(?<=^|\s)#([^\s]+)/g, '[[$1]]');
+	return review.replace(/(^|\s)#([^\s]+)/g, '$1[[$2]]');
 };
 
 export const parseHighlights = (
@@ -357,7 +355,7 @@ export const parseReviews = (resp: BookReviewResponse): Review[] => {
 	});
 };
 
-export const parseChapterReviews = (resp: BookReviewResponse): BookReview => {
+export const parseChapterReviews = (resp: BookReviewResponse, chapters: Chapter[] = []): BookReview => {
 	const reviews = parseReviews(resp);
 	const chapterReviews = reviews.filter((review) => review.type == 1);
 
@@ -376,11 +374,23 @@ export const parseChapterReviews = (resp: BookReviewResponse): BookReview => {
 	});
 
 	const entireReviews = reviews.filter((review) => review.type == 4);
+	// Chapter UIDs may arrive as numbers or decimal strings; absent IDs must not match.
+	const chapterKey = (uid: unknown): string | undefined => {
+		if (typeof uid === 'number' && Number.isSafeInteger(uid) && uid >= 0) return String(uid);
+		if (typeof uid === 'string' && /^(0|[1-9]\d*)$/.test(uid)) return uid;
+		return undefined;
+	};
+	const chapterTitles = new Map<string, string>();
+	for (const chapter of chapters) {
+		const key = chapterKey(chapter.chapterUid);
+		if (key !== undefined && chapter.title) chapterTitles.set(key, chapter.title);
+	}
 	const chapterResult = new Map();
 	for (const review of chapterReviews) {
 		const chapterUid = review.chapterUid;
 		const chapterTitle = review.chapterTitle;
-		const existChapter = chapterResult.get(review.chapterUid);
+		const key = chapterKey(chapterUid) ?? chapterUid;
+		const existChapter = chapterResult.get(key);
 		if (existChapter == null) {
 			const chapter: ChapterReview = {
 				chapterUid: chapterUid,
@@ -393,9 +403,10 @@ export const parseChapterReviews = (resp: BookReviewResponse): BookReview => {
 			} else {
 				chapter.chapterReviews.push(review);
 			}
-			chapterResult.set(review.chapterUid, chapter);
+			chapterResult.set(key, chapter);
 		} else {
-			const chapterRview: ChapterReview = chapterResult.get(review.chapterUid);
+			const chapterRview: ChapterReview = chapterResult.get(key);
+			if (!chapterRview.chapterTitle && chapterTitle) chapterRview.chapterTitle = chapterTitle;
 			if (review.range) {
 				chapterRview.reviews.push(review);
 			} else {
@@ -403,11 +414,67 @@ export const parseChapterReviews = (resp: BookReviewResponse): BookReview => {
 			}
 		}
 	}
-	const chapterReviewResult: ChapterReview[] = Array.from(chapterResult.values()).sort(
-		(o1, o2) => o1.chapterUid - o2.chapterUid
-	);
+	const chapterReviewResult: ChapterReview[] = Array.from(chapterResult.values());
+	for (const chapter of chapterReviewResult) {
+		const key = chapterKey(chapter.chapterUid);
+		const title = key === undefined ? undefined : chapterTitles.get(key);
+		if (!chapter.chapterTitle && title) chapter.chapterTitle = title;
+	}
+	chapterReviewResult.sort((o1, o2) => o1.chapterUid - o2.chapterUid);
 	return {
 		bookReviews: entireReviews,
 		chapterReviews: chapterReviewResult
 	};
+};
+
+const getFa = (id: string): [string, string[]] => {
+	if (/^\d*$/.test(id)) {
+		const c: string[] = [];
+		for (let a = 0; a < id.length; a += 9) {
+			const b = id.slice(a, Math.min(a + 9, id.length));
+			c.push(parseInt(b, 10).toString(16));
+		}
+		return ['3', c];
+	}
+	let d = '';
+	for (let i = 0; i < id.length; i++) {
+		d += id.charCodeAt(i).toString(16);
+	}
+	return ['4', [d]];
+};
+
+export const encodeWereadId = (id: string): string => {
+	const str = CryptoJS.MD5(id).toString(CryptoJS.enc.Hex);
+	const fa = getFa(id);
+	let strSub = str.slice(0, 3);
+	strSub += fa[0];
+	strSub += '2' + str.slice(str.length - 2, str.length);
+
+	for (let j = 0; j < fa[1].length; j++) {
+		const n = fa[1][j].length.toString(16);
+		if (n.length === 1) {
+			strSub += '0' + n;
+		} else {
+			strSub += n;
+		}
+		strSub += fa[1][j];
+		if (j < fa[1].length - 1) {
+			strSub += 'g';
+		}
+	}
+
+	if (strSub.length < 20) {
+		strSub += str.slice(0, 20 - strSub.length);
+	}
+
+	strSub += CryptoJS.MD5(strSub).toString(CryptoJS.enc.Hex).slice(0, 3);
+	return strSub;
+};
+
+export const getPcUrl = (bookId: string): string => {
+	return `https://weread.qq.com/web/reader/${encodeWereadId(bookId)}`;
+};
+
+export const getChapterReaderUrl = (bookId: string, chapterUid: number): string => {
+	return `https://weread.qq.com/web/reader/${encodeWereadId(bookId)}k${encodeWereadId(String(chapterUid))}`;
 };

@@ -11,18 +11,37 @@ import { WereadSettingsTab } from './src/settingTab';
 import WereadBrowserWindow from './src/components/wereadBrowserWindow';
 import WereadLoginModel from './src/components/wereadLoginModel';
 import { WEREAD_BROWSER_VIEW_ID, WereadReadingView } from './src/components/wereadReading';
-import { WEREAD_BOOKSHELF_VIEW_ID, WereadBookshelfView } from './src/components/wereadBookshelf';
-import { WEREAD_READING_STATS_VIEW_ID, WereadReadingStatsView } from './src/components/wereadReadingStats';
+import {
+	getReaderUrlForBookmark,
+	type WereadBookmarkLocation
+} from './src/utils/webReaderBookmark';
+import { WEREAD_BOOKSHELF_VIEW_ID } from './src/components/wereadBookshelf';
+import { WEREAD_READING_STATS_VIEW_ID } from './src/components/wereadReadingStats';
 import { WEREAD_BOOK_DETAIL_VIEW_ID, WereadBookDetailView } from './src/components/wereadBookDetailView';
+import { WereadJournalService } from './src/journal';
+import type { QuoteShareContent } from './src/quoteShareCard';
+import { WereadQuoteShareModal } from './src/components/wereadQuoteShare';
+import { WereadFavoritesService } from './src/favorites';
+import { WEREAD_TODAY_VIEW_ID, WEREAD_REVIEW_VIEW_ID } from './src/components/wereadJournal';
+import { WereadLibraryView, WEREAD_LIBRARY_VIEW_ID } from './src/components/wereadLibrary';
+import type { WereadTab } from './src/components/wereadPanel';
+import type { JournalMode } from './src/components/wereadJournal';
 import './style.css';
 export default class WereadPlugin extends Plugin {
 	private syncNotebooks: SyncNotebooks;
 	private bookshelfService: WereadBookshelfService;
+	private journalService: WereadJournalService;
+	public favoritesService: WereadFavoritesService;
 	private fileManager: FileManager;
 	private syncReadingStats: SyncReadingStats;
 	private wereadSettingsTab!: WereadSettingsTab;
 	private syncing = false;
 	private scheduledSyncTimer: number | null = null;
+	private libraryNavigation: Promise<void> = Promise.resolve();
+
+	public getJournalService(): WereadJournalService {
+		return this.journalService;
+	}
 
 	onload() {
 		console.log('load weread plugin');
@@ -43,6 +62,41 @@ export default class WereadPlugin extends Plugin {
 			return new WereadLoginModel(this.wereadSettingsTab).loginAndWait();
 		});
 		this.bookshelfService = new WereadBookshelfService(fileManager, apiRouter);
+		this.journalService = new WereadJournalService(this, apiRouter);
+		this.favoritesService = new WereadFavoritesService(this, {
+			folder: get(settingsStore).favoritesCanvasFolder,
+			locationVersion: get(settingsStore).favoritesCanvasLocationVersion,
+			commitLocation: settingsStore.actions.commitFavoritesCanvasLocation
+		});
+		this.addCommand({
+			id: 'open-weread-favorites',
+			name: '打开微信读书收藏',
+			callback: () => { void this.activateLibraryTab('favorites'); }
+		});
+		this.addCommand({
+			id: 'open-weread-favorites-canvas',
+			name: '打开微信读书收藏画布',
+			callback: async () => {
+				try {
+					const path = await this.favoritesService.ensureCanvas();
+					await this.app.workspace.openLinkText(path, '', true);
+				} catch (error) {
+					new Notice(error instanceof Error ? error.message : '收藏画布打开失败，请重试');
+				}
+			}
+		});
+		for (const [type, tab] of [
+			[WEREAD_LIBRARY_VIEW_ID, 'today'],
+			[WEREAD_TODAY_VIEW_ID, 'today'],
+			[WEREAD_REVIEW_VIEW_ID, 'review'],
+			[WEREAD_BOOKSHELF_VIEW_ID, 'bookshelf'],
+			[WEREAD_READING_STATS_VIEW_ID, 'stats']
+		] as const) {
+			this.registerView(type, (leaf) => new WereadLibraryView(leaf, this, apiRouter, this.bookshelfService, this.journalService, fileManager, tab, type));
+		}
+		for (const mode of ['today', 'review'] as const) {
+			this.addCommand({ id: `open-weread-${mode}`, name: mode === 'today' ? '打开微信读书今日' : '打开微信读书回顾', callback: () => { void this.activateJournalView(mode); } });
+		}
 		this.syncReadingStats = new SyncReadingStats(this.app.vault, apiRouter);
 
 		// 初始化时验证 Cookie 有效性
@@ -126,17 +180,30 @@ export default class WereadPlugin extends Plugin {
 
 		this.registerView(WEREAD_BROWSER_VIEW_ID, (leaf) => new WereadReadingView(leaf));
 		this.registerView(
-			WEREAD_BOOKSHELF_VIEW_ID,
-			(leaf) => new WereadBookshelfView(leaf, this, this.bookshelfService)
-		);
-		this.registerView(
-			WEREAD_READING_STATS_VIEW_ID,
-			(leaf) => new WereadReadingStatsView(leaf, apiRouter, fileManager)
-		);
-		this.registerView(
 			WEREAD_BOOK_DETAIL_VIEW_ID,
 			(leaf) => new WereadBookDetailView(leaf, apiRouter, this)
 		);
+
+		this.addCommand({
+			id: 'open-weread-book-detail',
+			name: '打开当前书籍详情',
+			checkCallback: (checking) => {
+				const file = this.app.workspace.getActiveFile();
+				if (!(file instanceof TFile)) return false;
+				const annotation = fileManager.getWereadNoteAnnotationFile(file);
+				if (!annotation?.bookId) return false;
+				if (!checking) {
+					void this.activateBookDetailView(
+						annotation.bookId,
+						annotation.title,
+						annotation.cover,
+						file.path,
+						true
+					);
+				}
+				return true;
+			}
+		});
 
 		this.addCommand({
 			id: 'open-weread-reading-view-tab',
@@ -163,6 +230,12 @@ export default class WereadPlugin extends Plugin {
 		});
 
 		this.addCommand({
+			id: 'open-weread-stats',
+			name: '打开微信读书统计',
+			callback: () => { void this.activateReadingStatsView(); }
+		});
+
+		this.addCommand({
 			id: 'sync-weread-reading-stats',
 			name: '同步阅读统计数据',
 			callback: () => {
@@ -183,7 +256,10 @@ export default class WereadPlugin extends Plugin {
 						.setIcon('refresh-ccw')
 						.setTitle('同步当前读书笔记')
 						.onClick(() => {
-							this.syncNotebooks.syncNotebook(noteFile);
+							void this.syncNotebooks.syncNotebook(noteFile).catch((error) => {
+								new Notice(error instanceof Error ? error.message : String(error));
+								console.error('[weread plugin] 同步当前笔记失败', error);
+							});
 						})
 				);
 			})
@@ -219,8 +295,8 @@ export default class WereadPlugin extends Plugin {
 		return get(settingsStore).readingOpenMode ?? 'TAB';
 	}
 
-	async openPreferredReadingView(url?: string) {
-		await this.activateReadingView(this.getPreferredReadingOpenMode(), url);
+	async openPreferredReadingView(url?: string, bookmark?: WereadBookmarkLocation) {
+		await this.activateReadingView(this.getPreferredReadingOpenMode(), url, bookmark);
 	}
 
 	async startSync(force = false, signal?: { cancelled: boolean }): Promise<number | undefined> {
@@ -255,15 +331,14 @@ export default class WereadPlugin extends Plugin {
 
 	async syncBookById(bookId: string) {
 		if (this.syncing) {
-			new Notice('正在同步微信读书笔记，请稍后再试');
-			return;
+			throw new Error(`(${bookId}) 正在同步微信读书笔记，请稍后再试`);
 		}
 		this.syncing = true;
 		try {
 			await this.syncNotebooks.syncBookById(bookId);
 		} catch (e) {
-			new Notice('同步当前书籍异常,请打开控制台查看详情');
-			console.error('同步当前书籍异常', e);
+			console.error(`同步当前书籍 (${bookId}) 异常`, e);
+			throw e;
 		} finally {
 			this.syncing = false;
 		}
@@ -279,13 +354,14 @@ export default class WereadPlugin extends Plugin {
 		new Notice('本地文件已删除');
 	}
 
-	async activateReadingView(type: string, url?: string) {
+	async activateReadingView(type: string, url?: string, bookmark?: WereadBookmarkLocation) {
 		const { workspace } = this.app;
-		const targetUrl = url ?? 'https://weread.qq.com/web/shelf';
+		const targetUrl =
+			url ?? (bookmark ? getReaderUrlForBookmark(bookmark) : 'https://weread.qq.com/web/shelf');
 
 		if (type === 'WINDOW') {
 			const browserWindow = new WereadBrowserWindow();
-			await browserWindow.open(targetUrl);
+			await browserWindow.open(targetUrl, bookmark);
 			return;
 		}
 
@@ -301,67 +377,68 @@ export default class WereadPlugin extends Plugin {
 			type: WEREAD_BROWSER_VIEW_ID,
 			active: true,
 			state: {
-				url: targetUrl
+				url: targetUrl,
+				bookmark
 			}
 		});
 
 		workspace.revealLeaf(leaf);
 	}
 
-	async activateBookshelfView() {
-		const { workspace } = this.app;
-		let leaf: WorkspaceLeaf | null = null;
-		const leaves = workspace.getLeavesOfType(WEREAD_BOOKSHELF_VIEW_ID);
-
-		if (leaves.length > 0) {
-			leaf = leaves[0];
-		} else {
-			leaf = workspace.getLeaf('tab');
-			await leaf.setViewState({ type: WEREAD_BOOKSHELF_VIEW_ID, active: true });
-		}
-
-		workspace.revealLeaf(leaf);
-	}
-
-	async activateReadingStatsView() {
-		const { workspace } = this.app;
-		const leaves = workspace.getLeavesOfType(WEREAD_READING_STATS_VIEW_ID);
-		let leaf: WorkspaceLeaf;
-		if (leaves.length > 0) {
-			leaf = leaves[0];
-		} else {
-			leaf = workspace.getLeaf('tab');
-			await leaf.setViewState({ type: WEREAD_READING_STATS_VIEW_ID, active: true });
-		}
-		workspace.revealLeaf(leaf);
-	}
-
-	async activateBookDetailView(bookId: string, bookTitle?: string, bookCover?: string, localFilePath?: string, replaceCurrentLeaf = false) {
-		const { workspace } = this.app;
-
-		let leaf: WorkspaceLeaf | null = null;
-
-		if (replaceCurrentLeaf) {
-			// 使用 getLeaf(false) 获取当前活跃的 leaf，不创建新 leaf
-			leaf = workspace.getLeaf(false);
-		} else {
-			// 原有逻辑：优先复用已有 detail leaf，否则新建一个 tab
-			const existingLeaves = workspace.getLeavesOfType(WEREAD_BOOK_DETAIL_VIEW_ID);
-			if (existingLeaves.length > 0) {
-				leaf = existingLeaves[0];
+	private activateLibraryTab(tab: WereadTab): Promise<void> {
+		this.libraryNavigation = this.libraryNavigation.catch((): void => undefined).then(async () => {
+			const workspace = this.app.workspace;
+			const active = workspace.getActiveViewOfType(WereadLibraryView);
+			const existing = [WEREAD_LIBRARY_VIEW_ID, WEREAD_TODAY_VIEW_ID, WEREAD_REVIEW_VIEW_ID, WEREAD_BOOKSHELF_VIEW_ID, WEREAD_READING_STATS_VIEW_ID]
+				.flatMap((type) => workspace.getLeavesOfType(type))[0];
+			const leaf = active?.leaf ?? existing ?? workspace.getLeaf('tab');
+			if (leaf.view instanceof WereadLibraryView) {
+				await leaf.view.selectTab(tab);
 			} else {
-				leaf = workspace.getLeaf('tab');
+				await leaf.setViewState({ type: WEREAD_LIBRARY_VIEW_ID, active: true, state: { tab } });
 			}
-		}
+			await workspace.revealLeaf(leaf);
+		});
+		return this.libraryNavigation;
+	}
 
-		if (leaf) {
-			await leaf.setViewState({
-				type: WEREAD_BOOK_DETAIL_VIEW_ID,
-				active: true,
-				state: { bookId, bookTitle, bookCover, localFilePath }
-			});
-			workspace.revealLeaf(leaf);
-		}
+	shareJournalNote(note: QuoteShareContent): void {
+		new WereadQuoteShareModal(this.app, note).open();
+	}
+
+	async activateJournalView(mode: JournalMode) { await this.activateLibraryTab(mode); }
+	async activateBookshelfView() { await this.activateLibraryTab('bookshelf'); }
+	async activateReadingStatsView() { await this.activateLibraryTab('stats'); }
+
+	async activateBookDetailView(
+		bookId: string,
+		bookTitle?: string,
+		bookCover?: string,
+		localFilePath?: string,
+		replaceCurrentLeaf = false
+	): Promise<void> {
+		this.libraryNavigation = this.libraryNavigation.catch((): void => undefined).then(async () => {
+			const { workspace } = this.app;
+			const selection = { bookId, bookTitle, bookCover, localFilePath };
+			const active = workspace.getActiveViewOfType(WereadLibraryView);
+			const existing = [WEREAD_LIBRARY_VIEW_ID, WEREAD_TODAY_VIEW_ID, WEREAD_REVIEW_VIEW_ID, WEREAD_BOOKSHELF_VIEW_ID, WEREAD_READING_STATS_VIEW_ID]
+				.flatMap((type) => workspace.getLeavesOfType(type))
+				.find((candidate) => candidate.view instanceof WereadLibraryView);
+			const leaf = replaceCurrentLeaf
+				? workspace.getLeaf(false)
+				: active?.leaf ?? existing ?? workspace.getLeaf(false);
+			if (leaf.view instanceof WereadLibraryView) {
+				await leaf.view.openBookDetail(selection);
+			} else {
+				await leaf.setViewState({
+					type: WEREAD_LIBRARY_VIEW_ID,
+					active: true,
+					state: { tab: 'bookshelf', bookDetail: selection, originTab: 'bookshelf' }
+				});
+			}
+			await workspace.revealLeaf(leaf);
+		});
+		return this.libraryNavigation;
 	}
 
 	private async syncCookiesToPartition(): Promise<void> {
@@ -466,6 +543,8 @@ export default class WereadPlugin extends Plugin {
 
 	onunload() {
 		console.log('unloading weread plugin', new Date().toLocaleString());
+		this.journalService?.dispose();
+		this.favoritesService?.dispose();
 		this.clearScheduledSyncTimer();
 	}
 
@@ -479,22 +558,24 @@ export default class WereadPlugin extends Plugin {
 		}
 		const intervalMs = Math.max(1, scheduledSyncInterval) * 60 * 1000;
 		console.log(`[weread plugin] 设置定时同步，间隔 ${scheduledSyncInterval} 分钟`);
-		this.scheduledSyncTimer = window.setInterval(async () => {
-			console.log('[weread plugin] 执行定时同步');
-			try {
-				const syncedCount = await this.syncNotebooks.syncNotebooks(
-					false,
-					window.moment().format('YYYY-MM-DD')
-				);
-				// 获取同步的书籍信息并更新设置
-				const settings = get(settingsStore);
-				const bookTitles = settings.lastSyncBookTitles || [];
-				settingsStore.actions.updateLastSyncInfo(syncedCount || 0, bookTitles);
-				new Notice(`定时同步完成，共同步 ${syncedCount || 0} 本书`);
-			} catch (e) {
-				console.error('[weread plugin] 定时同步失败', e);
-				new Notice('定时同步失败，请查看控制台');
-			}
+		this.scheduledSyncTimer = window.setInterval(() => {
+			void (async () => {
+				console.log('[weread plugin] 执行定时同步');
+				try {
+					const syncedCount = await this.syncNotebooks.syncNotebooks(
+						false,
+						window.moment().format('YYYY-MM-DD')
+					);
+					// 获取同步的书籍信息并更新设置
+					const settings = get(settingsStore);
+					const bookTitles = settings.lastSyncBookTitles || [];
+					settingsStore.actions.updateLastSyncInfo(syncedCount || 0, bookTitles);
+					new Notice(`定时同步结束，共更新 ${syncedCount || 0} 本书`);
+				} catch (e) {
+					console.error('[weread plugin] 定时同步失败', e);
+					new Notice('定时同步失败，请查看控制台');
+				}
+			})();
 		}, intervalMs);
 	}
 

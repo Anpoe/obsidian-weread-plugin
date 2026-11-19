@@ -1,0 +1,1502 @@
+// Run: node --test tests/journalView.mjs
+// Set CHROME_BIN to override the Chrome executable. Skips if Chrome is unavailable.
+// Renders the production view in real Chrome with local fixtures; makes no API calls.
+import assert from 'node:assert/strict';
+import { spawn } from 'node:child_process';
+import { access, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
+import test from 'node:test';
+import { build } from 'esbuild';
+
+const chromeBin =
+	process.env.CHROME_BIN || '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
+let available = true;
+try {
+	await access(chromeBin);
+} catch {
+	available = false;
+}
+
+const fixture = String.raw`
+import { WereadJournalView } from './src/components/wereadJournal';
+import { WereadFavoritesPanel } from './src/components/wereadFavorites';
+import { settingsStore } from './src/settings';
+import { getPcUrl } from './src/parser/parseResponse';
+const RealDate = Date;
+const NOW = RealDate.parse('2026-11-06T04:00:00Z');
+window.Date = class extends RealDate {
+  constructor(...args) { if (args.length) super(...args); else super(NOW); }
+  static now() { return NOW; }
+};
+Math.random = () => 0;
+const intervals = new Set();
+const originalSet = window.setInterval.bind(window);
+const originalClear = window.clearInterval.bind(window);
+window.setInterval = (...args) => { const id = originalSet(...args); intervals.add(id); return id; };
+window.clearInterval = (id) => { intervals.delete(id); originalClear(id); };
+const create = function(tag, options = {}) {
+  if (typeof options === 'string') options = { cls: options };
+  const node = document.createElement(tag);
+  if (options.cls) node.className = options.cls;
+  if (options.text !== undefined) node.textContent = options.text;
+  for (const key of ['type', 'href', 'value']) if (options[key] !== undefined) node[key] = options[key];
+  for (const [key, value] of Object.entries(options.attr || {})) {
+    if (tag === 'img' && key === 'src' && String(value).startsWith('https://fixture.invalid/')) {
+      const color = String(value).includes('latest') ? '#a68a64' : String(value).includes('third') ? '#647e87' : '#718562';
+      node.src = 'data:image/svg+xml,' + encodeURIComponent('<svg xmlns="http://www.w3.org/2000/svg" width="64" height="90"><rect width="64" height="90" rx="3" fill="' + color + '"/><text x="32" y="39" text-anchor="middle" fill="#fff" font-size="12" font-family="serif">阅读</text><path d="M12 63h40M12 68h28" stroke="#fff" stroke-opacity=".45"/></svg>');
+      node.loading = 'eager';
+    } else node.setAttribute(key, value);
+  }
+  if (tag === 'img' && node.src.startsWith('data:image/svg+xml,')) node.loading = 'eager';
+  this.append(node);
+  return node;
+};
+HTMLElement.prototype.createEl = create;
+HTMLElement.prototype.createDiv = function(options) { return create.call(this, 'div', options); };
+HTMLElement.prototype.createSpan = function(options) { return create.call(this, 'span', options); };
+HTMLElement.prototype.empty = function() { this.replaceChildren(); };
+HTMLElement.prototype.addClass = function(...names) { this.classList.add(...names); };
+HTMLElement.prototype.setText = function(text) { this.textContent = text; };
+const check = (value, message) => { if (!value) throw new Error(message); assertions.push(message); };
+const assertions = [];
+const clipboardWrites = [];
+let clipboardFails = false;
+Object.defineProperty(navigator, 'clipboard', {configurable: true, value: {async writeText(text) { if (clipboardFails) throw new Error('clipboard denied'); clipboardWrites.push(text); }}});
+const tick = () => new Promise((resolve) => setTimeout(resolve, 0));
+const gate = () => { let resolve; const promise = new Promise((done) => { resolve = done; }); return {promise, resolve}; };
+const note = (id, bookId, kind, text, date) => ({
+  id: bookId + ':' + kind + ':' + id, bookId, bookType: 0, kind, text, createTime: RealDate.parse(date), cover: 'https://fixture.invalid/' + bookId + '.svg',
+  bookTitle: bookId === 'a' ? '山间的阅读' : '城市与记忆', author: bookId === 'a' ? '林间' : '周行',
+  chapterTitle: '在日常里发现光', sourceUrl: 'weread://reading?bId=' + bookId
+});
+const baseNotes = [
+  note('today-h', 'a', 'highlight', '晨光穿过树叶，阅读让平凡的一天有了新的层次。', '2026-11-05T16:30:00Z'),
+  note('today-r', 'a', 'thought', '今日想法：慢下来，看见身边被忽略的细节。', '2026-11-06T02:00:00Z'),
+  note('old-one', 'a', 'highlight', '昨日句子：脚步可以慢一些，方向要清楚。', '2026-11-05T15:59:00Z'),
+  note('old-two', 'a', 'highlight', '另一个旧句：在山与水之间，找回内心的安静。', '2026-11-05T08:00:00Z'),
+  note('other-book', 'b', 'highlight', '城市记忆：每一条街道都藏着故事。', '2026-11-04T02:00:00Z'),
+  note('anniversary', 'b', 'thought', '去年今日：书页记录了成长的痕迹。', '2025-11-06T02:00:00Z'),
+  note('future', 'b', 'thought', 'FUTURE SENTINEL', '2026-11-06T16:30:00Z')
+];
+let state = { notes: baseNotes, totalBooks: 2, scannedBooks: 2, failedBooks: 0, updatedAt: NOW, syncing: false, error: '', hasCache: true };
+const listeners = new Set();
+const journal = {
+  getSnapshot: () => state,
+  subscribe(listener) { listeners.add(listener); listener(state); return () => listeners.delete(listener); },
+  async load() { journalLoads++; return state; },
+  publish(next = state) { state = next; for (const listener of listeners) listener(state); }
+};
+let favoriteState = { favorites: [], loaded: true, loading: false, writable: true, error: '', warning: '', pendingIds: [] };
+const favoriteListeners = new Set();
+let favoriteWriteGate;
+let favoriteWriteFails = false;
+let favoriteWrites = 0;
+let canvasEnsureGate;
+let canvasEnsureFails = false;
+let canvasEnsureCalls = 0;
+let canvasOpenFails = false;
+const canvasOpens = [];
+const favoriteLoads = [];
+let journalLoads = 0;
+const favorites = {
+  getSnapshot: () => favoriteState,
+  subscribe(listener) { favoriteListeners.add(listener); listener(favoriteState); return () => favoriteListeners.delete(listener); },
+  publish(patch = {}) { favoriteState = {...favoriteState, ...patch}; for (const listener of favoriteListeners) listener(favoriteState); },
+  async load(force) { favoriteLoads.push(force); return favoriteState; },
+  isFavorite(id) { return favoriteState.favorites.some(entry => entry.id === id); },
+  async write(id, change) {
+    favoriteWrites++; this.publish({pendingIds: [id]});
+    try {
+      if (favoriteWriteGate) await favoriteWriteGate.promise;
+      if (favoriteWriteFails) throw new Error('FAKE DISK WRITE FAILED');
+      change(); this.publish({pendingIds: [], error: ''});
+    } catch (error) { this.publish({pendingIds: [], error: error.message}); throw error; }
+  },
+  async setFavorite(note, active) {
+    await this.write(note.id, () => { favoriteState.favorites = favoriteState.favorites.filter(entry => entry.id !== note.id); if (active) favoriteState.favorites.push({id: note.id, note: {...note}, favoritedAt: NOW, updatedAt: NOW}); });
+  },
+  async remove(id) { await this.write(id, () => { favoriteState.favorites = favoriteState.favorites.filter(entry => entry.id !== id); }); },
+  async restore(entry) { await this.write(entry.id, () => { favoriteState.favorites = [...favoriteState.favorites.filter(current => current.id !== entry.id), {...entry, note: {...entry.note}}]; }); },
+  async ensureCanvas() {
+    canvasEnsureCalls++;
+    if (canvasEnsureGate) await canvasEnsureGate.promise;
+    if (canvasEnsureFails) throw new Error('CANVAS ENSURE FAILED FIXTURE');
+    return 'WereadData/favorites/favorites.canvas';
+  }
+};
+const readingOpens = [];
+const sharedNotes = [];
+const externalOpens = [];
+const browserOpens = [];
+let readingOpenFails = false;
+window.journalExternalOpens = externalOpens;
+window.open = (url) => { browserOpens.push(url); return null; };
+const settings = (key) => ({ bookOpenMode: 'web', wereadApiKey: key, userVid: '', cookies: [], journalRefreshHours: 24, journalExcludedBookIds: [], saveArticleToggle: true, favoritesViewMode: 'cards' });
+settingsStore.set(settings('account-a'));
+const plugin = {
+  app: {workspace: {async openLinkText(...args) {
+    if (canvasOpenFails) throw new Error('CANVAS OPEN FAILED FIXTURE');
+    canvasOpens.push(args);
+  }}},
+  favoritesService: favorites,
+  shareJournalNote(note) { sharedNotes.push({...note}); },
+  async activateJournalView() {}, async activateBookshelfView() {}, async activateReadingStatsView() {},
+  async activateBookDetailView() {},
+  async openPreferredReadingView(...args) {
+    readingOpens.push(args);
+    if (readingOpenFails) throw new Error('PRIVATE WEB OPEN FAILURE DATA');
+  }
+};
+let apiCalls = 0;
+let api = {
+  async getShelf() { apiCalls++; return {books: [
+    { bookId: 'older', title: 'OLDER BOOK SENTINEL', author: '旧书', readUpdateTime: NOW / 1000 - 400 },
+    { bookId: 'a', title: '山间的阅读', author: '林间', readUpdateTime: NOW / 1000 - 60 },
+    { bookId: 'third', title: '第三本今日书', author: '作者三', readUpdateTime: NOW / 1000 - 120 },
+    { bookId: 'latest', title: '新书', author: '作者一', readUpdateTime: NOW / 1000 - 30 },
+    { bookId: 'fourth', title: 'FOURTH BOOK SENTINEL', author: '作者四', readUpdateTime: NOW / 1000 - 300 },
+    { bookId: 'b', title: 'YESTERDAY BOOK SENTINEL', readUpdateTime: RealDate.parse('2026-11-05T15:59:00Z') / 1000 }
+  ].map((book) => ({...book, cover: 'https://fixture.invalid/' + book.bookId + '.svg'}))}; },
+  async getReadingStats() { apiCalls++; return { readTimes: { [RealDate.parse('2026-11-05T16:00:00Z') / 1000]: 3660 } }; }
+};
+let view;
+let favoritesPreviewPanel;
+const closeFavoritesPreview = async () => {
+  if (!favoritesPreviewPanel) return;
+  await favoritesPreviewPanel.onClose();
+  favoritesPreviewPanel.contentEl.remove();
+  favoritesPreviewPanel = undefined;
+};
+const mount = async (mode, cache = journal, router = api) => {
+  if (view) { await view.onClose(); view.contentEl.remove(); }
+  view = new WereadJournalView({}, plugin, cache, router, mode);
+  await view.onOpen(); await tick(); return view;
+};
+const click = (label, root = document) => {
+  const button = [...root.querySelectorAll('button')].find((node) => node.textContent === label || node.getAttribute('aria-label') === label);
+  check(button && !button.disabled, 'button available: ' + label); button.click();
+};
+const cards = (root = document) => [...root.querySelectorAll('article')].map((node) => node.textContent);
+const results = () => document.querySelector('.weread-journal-day-notes');
+window.smoke = {
+  assertions,
+  async importProgress() {
+    const previousState=state, previousFavorites=favoriteState, previousSettings=settingsStore.current();
+    const frame=()=>new Promise(resolve=>requestAnimationFrame(resolve));
+    try {
+      for(const mode of ['today','review']) {
+        settingsStore.set({...settingsStore.current(), journalExcludedBookIds:[], journalIncludeArticles:true});
+        favorites.publish({favorites:[],loaded:true,loading:false,writable:true,pendingIds:[],error:'',warning:''});
+        const anniversary=note('progress-anniversary','a','highlight','Initial anniversary highlight','2025-11-06T03:00:00Z');
+        journal.publish({...previousState,notes:[...baseNotes,anniversary],hasCache:false,syncing:true,scannedBooks:142,totalBooks:565,error:'',failedBooks:0});
+        await mount(mode);
+        const region=()=>view.contentEl.querySelector(mode==='today'?'.weread-journal-today-notes':'.weread-journal-day-notes');
+        const article=()=>region().querySelector('[data-favorite-id="'+baseNotes[0].id+'"]').closest('article');
+        const initialArticle=article();
+        const copy=initialArticle.querySelector('.weread-journal-note-actions button');
+        const star=initialArticle.querySelector('.weread-journal-favorite');
+        const sort=region().querySelector('.weread-journal-sort');
+        const quote=view.contentEl.querySelector('.weread-journal-quote article');
+        const share=quote.querySelector('.weread-journal-share'), shareSvg=share?.querySelector('svg');
+        check(share&&share.classList.contains('clickable-icon')&&region().querySelector('.weread-journal-share'),mode+': shared accessible controls cover quotes and ordinary notes');
+        for(const card of view.contentEl.querySelectorAll('article.weread-journal-note')) {
+          const expected=state.notes.find(note=>note.text===card.querySelector('.weread-journal-note-text').textContent);
+          const control=card.querySelector('.weread-share-button');
+          check(control?.getAttribute('aria-label')==='分享卡片',mode+': each rendered sentence has the common share component');
+          control.click();const snapshot=sharedNotes.at(-1);
+          check(snapshot.id===expected.id&&snapshot.text===expected.text&&snapshot.bookTitle===expected.bookTitle&&snapshot.createTime===expected.createTime&&snapshot.kind===expected.kind,mode+': note/anniversary/thought sharing retains full content and source');
+        }
+        const entryShare=initialArticle.querySelector('.weread-share-button'),entryShareSvg=entryShare.querySelector('svg');
+        const anniversarySort=mode==='review'?view.contentEl.querySelector('.weread-journal-sort[data-sort-scope="anniversary"]'):undefined;
+        const anniversaryCard=mode==='review'?view.contentEl.querySelector('[data-favorite-id="'+anniversary.id+'"]').closest('article'):undefined;
+        const originalSvgs=[copy,star,sort].map(button=>button.querySelector('svg'));
+        const query=mode==='review'?view.contentEl.querySelector('input[type="search"]'):undefined;
+        if(query) query.focus();
+        const assertStable=label=>{
+          check(article()===initialArticle&&copy.isConnected&&star.isConnected&&region().querySelector('.weread-journal-sort')===sort,mode+': '+label+' retains existing note and copy/star/sort controls');
+          check([copy,star,sort].every((button,index)=>button.querySelector('svg')===originalSvgs[index]),mode+': '+label+' retains existing SVG nodes');
+          check(share.isConnected&&share.querySelector('svg')===shareSvg&&entryShare.isConnected&&entryShare.querySelector('svg')===entryShareSvg,mode+': '+label+' retains quote and ordinary-note share icons');
+          check(view.contentEl.querySelector('.weread-journal-quote article')===quote,mode+': '+label+' retains the selected old quote');
+          if(anniversarySort) check(anniversarySort.isConnected&&view.contentEl.querySelector('.weread-journal-sort[data-sort-scope="anniversary"]')===anniversarySort&&anniversaryCard.isConnected, 'Review: '+label+' retains anniversary controls and existing year cards');
+          if(query) check(query.isConnected&&document.activeElement===query,mode+': '+label+' preserves focused search');
+        };
+        for(let i=0;i<12;i++) {
+          journal.publish({...state,notes:state.notes.map(entry=>({...entry})),scannedBooks:143+i});
+          await frame();assertStable('progress-only update '+i);
+        }
+        check(view.contentEl.querySelector('.weread-journal-status').textContent.includes('154/565'),mode+': progress remains live without body replacement');
+        for(let i=0;i<4;i++) {
+          journal.publish({...state,scannedBooks:155+i,notes:[...state.notes,
+            note('import-visible-'+i,'a','highlight','IMPORTED VISIBLE '+i,'2026-11-06T04:00:0'+i+'Z'),
+            note('import-same-'+i,'a','highlight','IMPORTED SAME BOOK '+i,'2026-11-04T04:00:00Z'),
+            note('import-other-'+i,'new-'+i,'highlight','IMPORTED OTHER BOOK '+i,'2026-11-03T04:00:00Z'),
+            note('import-anniversary-'+i,'a','highlight','IMPORTED ANNIVERSARY '+i,'2024-11-06T04:00:00Z')
+          ]});
+          await frame();assertStable('new book result '+i);
+          check(region().textContent.includes('IMPORTED VISIBLE '+i),mode+': new visible notes appear during import');
+          if(mode==='review') {
+            check(view.contentEl.querySelector('.weread-journal-day[data-note-count="'+(3+i)+'"]').getAttribute('aria-label').startsWith('2026-11-06，'), 'Review: heatmap counts update during import');
+            check(view.contentEl.querySelector('.weread-journal-anniversary-year[data-year="2024"]').textContent.includes('IMPORTED ANNIVERSARY '+i), 'Review: new anniversary year groups appear during import');
+          }
+        }
+        journal.publish({...state,notes:state.notes.map(entry=>entry.id===baseNotes[0].id?{...entry,text:'UPDATED IMPORT HIGHLIGHT'}:entry)});
+        await frame();assertStable('same-ID note edit');
+        check(initialArticle.textContent.includes('UPDATED IMPORT HIGHLIGHT'),mode+': existing note text updates without stale cached cards');
+        journal.publish({...state,hasCache:true,syncing:false,updatedAt:NOW});
+        await frame();assertStable('import completion');
+        check(!view.contentEl.querySelector('.weread-journal-refresh').disabled,mode+': completion enables refresh');
+        if(mode==='today') {
+          check(view.contentEl.querySelector('.weread-journal-today-metrics').textContent.includes('5 条'), 'Today: imported highlight counts update');
+          check(!view.contentEl.querySelector('.weread-journal-metric-status'), 'Today: completion removes partial-result explanations');
+        }
+        journal.publish({...state,notes:state.notes.filter(entry=>!entry.id.includes('import-anniversary-')&&!entry.id.includes('import-other-0'))});
+        await frame();assertStable('removed cached notes');
+        if(mode==='review') check(!view.contentEl.querySelector('.weread-journal-anniversary-year[data-year="2024"]'), 'Review: obsolete anniversary year groups disappear incrementally');
+        copy.click();await tick();
+        check(clipboardWrites.at(-1)==='UPDATED IMPORT HIGHLIGHT',mode+': retained copy handler uses the latest note text');
+        entryShare.click();check(sharedNotes.at(-1).text==='UPDATED IMPORT HIGHLIGHT',mode+': retained ordinary-note sharing reads the latest text');
+        favoriteWriteGate=gate();star.click();await tick();
+        check(star.disabled,mode+': retained star reflects pending persistence');
+        journal.publish({...state,notes:state.notes.map(entry=>({...entry})),syncing:true,scannedBooks:160});await frame();
+        check(star.isConnected&&star.disabled&&article()===initialArticle,mode+': import progress preserves the pending favorite control');
+        favoriteWriteGate.resolve();await tick();favoriteWriteGate=undefined;
+        check(star.isConnected&&!star.disabled&&star.getAttribute('aria-pressed')==='true',mode+': retained star completes persistence');
+        check(favoriteState.favorites.find(entry=>entry.id===baseNotes[0].id)?.note.text==='UPDATED IMPORT HIGHLIGHT',mode+': retained star saves the latest note snapshot');
+        const quoteId=quote.querySelector('.weread-journal-favorite').dataset.favoriteId;
+        journal.publish({...state,notes:state.notes.map(entry=>entry.id===quoteId?{...entry,text:'LATEST QUOTE SHARE SNAPSHOT'}:entry)});
+        await frame();assertStable('updated quote share snapshot');share.click();
+        check(sharedNotes.at(-1).id===quoteId&&sharedNotes.at(-1).text==='LATEST QUOTE SHARE SNAPSHOT',mode+': sharing uses the latest selected quote snapshot');
+        Math.random=()=>0.999999;
+        click('换一句');await tick();
+        const shareCalls=sharedNotes.length;share.click();
+        check(sharedNotes.length===shareCalls,mode+': detached old share action cannot share a different quote');
+        check(view.contentEl.querySelector('.weread-journal-quote').textContent.includes('IMPORTED SAME BOOK 3'),mode+': retained quote actions include newly imported same-book candidates');
+        click('换一本');await tick();
+        check(view.contentEl.querySelector('.weread-journal-quote').textContent.includes('IMPORTED OTHER BOOK 3'),mode+': quote actions include newly imported other books');
+        Math.random=()=>0;
+        await view.onClose();view.contentEl.remove();view=undefined;
+      }
+    } finally {
+      favoriteWriteGate?.resolve();favoriteWriteGate=undefined;Math.random=()=>0;
+      if(view){await view.onClose();view.contentEl.remove();view=undefined;}
+      state=previousState;favoriteState=previousFavorites;settingsStore.set(previousSettings);
+    }
+    return assertions.length;
+  },
+  async originalNavigation() {
+    const previousState = state;
+    const located = {...baseNotes[0], sourceUrl: 'weread://bestbookmark?bookId=a&chapterUid=42&rangeStart=10&rangeEnd=28'};
+    const expectedBookmark = (record) => ({bookId: record.bookId, chapterUid: 42, rangeStart: 10, rangeEnd: 28, chapterTitle: record.chapterTitle, markText: record.text});
+    const setMode = (bookOpenMode) => settingsStore.set({...settingsStore.current(), bookOpenMode});
+    const originalIn = (root) => root?.querySelector('.weread-journal-note-meta a[aria-label], .weread-journal-note-meta button[aria-label="回到原文"], .weread-journal-note-meta button[aria-label="打开书籍"], .weread-favorites-meta a[aria-label]');
+    const activate = async (action) => {
+      check(action, 'Original action exists in the production note renderer');
+      let preventedByView = false;
+      const stopBrowser = (event) => { preventedByView = event.defaultPrevented; event.preventDefault(); };
+      document.addEventListener('click', stopBrowser, {once: true});
+      action.dispatchEvent(new MouseEvent('click', {bubbles: true, cancelable: true}));
+      await tick();
+      return preventedByView;
+    };
+    const expectWeb = async (root, record, label) => {
+      const count = readingOpens.length, externalCount = externalOpens.length;
+      const prevented = await activate(originalIn(root));
+      check(readingOpens.length === count + 1, 'REGRESSION: ' + label + ' web original must call plugin.openPreferredReadingView instead of leaving a raw weread:// navigation');
+      check(prevented && externalOpens.length === externalCount, label + ' intercepts browser navigation without opening an external deep link');
+      check(JSON.stringify(readingOpens.at(-1)) === JSON.stringify([undefined, expectedBookmark(record)]), label + ' preserves book, chapter, range, chapter title and mark text');
+      check(originalIn(root).querySelector('svg[data-weread-icon="book-arrow-up-right"]'), label + ' original action renders the approved book-and-arrow icon');
+    };
+    journal.publish({...state, notes: [located]});
+    setMode('web'); await mount('today');
+    await expectWeb(document.querySelector('.weread-journal-today-notes'), located, 'Today');
+    const retained = originalIn(document.querySelector('.weread-journal-today-notes'));
+    setMode('app');
+    const webCount = readingOpens.length;
+    check(await activate(retained), 'Setting switch after render still prevents browser navigation');
+    check(readingOpens.length === webCount && externalOpens.at(-1) === located.sourceUrl, 'Existing original action reads latest app mode and opens the bookmark through the desktop shell');
+    setMode('web'); await expectWeb(document.querySelector('.weread-journal-today-notes'), located, 'Today switched back');
+    const continueReading = document.querySelector('.weread-journal-today-book-list .weread-journal-original');
+    const beforeContinue = readingOpens.length;
+    check(await activate(continueReading), 'Today continue-reading action prevents browser navigation');
+    check(readingOpens.length === beforeContinue + 1 && readingOpens.at(-1)[0] === getPcUrl('latest') && readingOpens.at(-1)[1] === undefined, 'Today latest-book action opens the preferred web book reader');
+    setMode('app'); await activate(continueReading);
+    check(externalOpens.at(-1) === 'weread://reading?bId=latest', 'Rendered continue-reading action observes latest app setting');
+    setMode('web');
+
+    const selected = {...baseNotes[2], sourceUrl: located.sourceUrl};
+    const anniversary = {...baseNotes[5], sourceUrl: 'weread://bestbookmark?bookId=b&chapterUid=42&rangeStart=10&rangeEnd=28'};
+    journal.publish({...state, notes: [located, selected, anniversary]});
+    await mount('review');
+    document.querySelector('button[aria-label^="2026-11-05，"]').click();
+    await expectWeb(results(), selected, 'Review selected day');
+    const search = document.querySelector('input[type=search]');
+    search.value = selected.text; search.dispatchEvent(new Event('input'));
+    await expectWeb(results(), selected, 'Review search');
+    search.value = ''; search.dispatchEvent(new Event('input'));
+    await expectWeb(document.querySelector('.weread-journal-anniversaries'), anniversary, 'Review anniversary');
+    const quote = document.querySelector('.weread-journal-quote');
+    if (originalIn(quote)) await expectWeb(quote, selected, 'Old quote');
+
+    for (const sourceUrl of [undefined, 'weread://reading?bId=a', 'weread://bestbookmark?bookId=wrong-book&chapterUid=42&rangeStart=10&rangeEnd=28', 'weread://reading?bId=wrong-book', 'weread://bestbookmark?bookId=a&chapterUid=oops&rangeStart=10&rangeEnd=28', 'weread://bestbookmark?bookId=a&chapterUid=42&rangeStart=NaN&rangeEnd=28', 'https://evil.invalid/?bookId=wrong-book', 'weread://bestbookmark?bookId=%E0%A4%A&chapterUid=42&rangeStart=10&rangeEnd=28']) {
+      const fallback = {...located, sourceUrl};
+      journal.publish({...state, notes: [fallback]}); setMode('web'); await mount('today');
+      const before = readingOpens.length, externalBefore = externalOpens.length;
+      check(await activate(originalIn(document.querySelector('.weread-journal-today-notes'))), 'Fallback web action intercepts navigation for ' + sourceUrl);
+      check(readingOpens.length === before + 1 && readingOpens.at(-1)[0] === getPcUrl(fallback.bookId) && readingOpens.at(-1)[1] === undefined && externalOpens.length === externalBefore, 'Missing or invalid location opens only the note book in the web reader: ' + sourceUrl);
+      setMode('app'); await activate(originalIn(document.querySelector('.weread-journal-today-notes')));
+      check(externalOpens.at(-1) === 'weread://reading?bId=a', 'Missing or invalid location app fallback cannot navigate to another book: ' + sourceUrl);
+    }
+
+    journal.publish({...state, notes: [located]}); setMode('web'); await mount('today');
+    const failures = [];
+    const onUnhandled = (event) => { failures.push(String(event.reason)); event.preventDefault(); };
+    window.addEventListener('unhandledrejection', onUnhandled);
+    readingOpenFails = true;
+    const noticesBefore = (window.journalNotices || []).length;
+    await activate(originalIn(document.querySelector('.weread-journal-today-notes')));
+    check(window.journalNotices.length > noticesBefore && /失败|无法/.test(window.journalNotices.at(-1)) && !window.journalNotices.at(-1).includes('PRIVATE WEB OPEN FAILURE DATA'), 'Failed web original gives a safe user-facing failure notice');
+    readingOpenFails = false;
+    await expectWeb(document.querySelector('.weread-journal-today-notes'), located, 'Retry after failed open');
+    check(failures.length === 0, 'Failed web original and retry never produce an unhandled rejection');
+    const previousFavorites = favoriteState;
+    const host = document.createElement('main'); document.body.append(host);
+    favorites.publish({favorites: [{id: located.id, note: located, favoritedAt: NOW, updatedAt: NOW}]});
+    const panel = new WereadFavoritesPanel(host, plugin, favorites); await panel.onOpen();
+    await expectWeb(host, located, 'Favorites');
+    setMode('app'); const favoriteWebCount = readingOpens.length;
+    check(await activate(originalIn(host)), 'Favorites app action intercepts browser navigation');
+    check(readingOpens.length === favoriteWebCount && externalOpens.at(-1) === located.sourceUrl, 'Favorites app action preserves the location through the native shell');
+    await panel.onClose(); host.remove(); favorites.publish(previousFavorites);
+    check(browserOpens.length === 0, 'Desktop original actions use the preferred reader or native shell without browser window.open');
+    window.removeEventListener('unhandledrejection', onUnhandled);
+    readingOpens.length = 0; externalOpens.length = 0;
+    journal.publish(previousState); settingsStore.set(settings('account-a'));
+    return assertions;
+  },
+  async iconSetup() {
+    await closeFavoritesPreview();
+    journal.publish({...state, notes: baseNotes, syncing: false, error: ''});
+    await mount('today');
+  },
+  async iconCleanup() {
+    await closeFavoritesPreview();
+    favorites.publish({favorites: []});
+  },
+  iconGeometry(selectors) {
+    return selectors.flatMap(selector => {
+      const nodes = [...document.querySelectorAll(selector)];
+      check(nodes.length > 0, 'Production icon control exists: ' + selector);
+      return nodes.map(node => {
+        const svg = node.querySelector('svg');
+        check(svg, 'Production icon SVG exists: ' + selector);
+        const box = node.getBoundingClientRect(), icon = svg.getBoundingClientRect(), style = getComputedStyle(node);
+        const left = box.left + parseFloat(style.paddingLeft) + parseFloat(style.borderLeftWidth || 0);
+        const right = box.right - parseFloat(style.paddingRight) - parseFloat(style.borderRightWidth || 0);
+        return {selector, width: icon.width, height: icon.height, contentWidth: right - left, padding: style.padding,
+          fits: icon.left >= left - 1 && icon.right <= right + 1 && icon.top >= box.top - 1 && icon.bottom <= box.bottom + 1};
+      });
+    });
+  },
+  async noteSorting() {
+    const previousState = state;
+    const notes = Array.from({length: 105}, (_, index) => ({...note('sort-' + index, 'a', index % 2 ? 'thought' : 'highlight', 'SORT NOTE ' + index, '2026-11-06T01:00:00Z'), createTime: RealDate.parse('2026-11-06T01:00:00Z') + index * 60000}));
+    const older = [note('older-early', 'a', 'thought', 'OLDER EARLY', '2026-11-05T01:00:00Z'), note('older-late', 'a', 'thought', 'OLDER LATE', '2026-11-05T02:30:00Z')];
+    const anniversaries = [note('anniversary-early', 'b', 'highlight', 'ANNIVERSARY EARLY', '2025-11-06T01:00:00Z'), note('anniversary-late', 'b', 'highlight', 'ANNIVERSARY LATE', '2025-11-06T02:00:00Z')];
+    const cache = [...notes.slice(40), ...older, ...anniversaries, ...notes.slice(0, 40)];
+    const cacheOrder = cache.map(note => note.id).join('|');
+    journal.publish({...state, notes: cache, syncing: false}); await mount('today');
+    const bodies = root => [...root.querySelectorAll('article .weread-journal-note-text')].map(node => node.textContent);
+    const today = () => document.querySelector('.weread-journal-today-notes');
+    const sort = root => root.querySelector('.weread-journal-sort');
+    check(sort(today())?.dataset.sortOrder === 'desc', 'Today exposes latest-first time sorting in its note heading');
+    check(bodies(today()).length === 100 && bodies(today())[0] === 'SORT NOTE 104' && bodies(today()).at(-1) === 'SORT NOTE 5', 'Today sorts all cached timestamps before its first-page limit');
+    check(/2026\/11\/0?6\s+10:44/.test(today().querySelector('.weread-journal-note-meta small').textContent), 'Journal metadata includes local hours and minutes with the note date');
+    const quoteText = document.querySelector('.weread-journal-quote .weread-journal-note-text').textContent;
+    sort(today()).focus(); sort(today()).click();
+    check(sort(today()).dataset.sortOrder === 'asc' && /最早在前/.test(sort(today()).title) && sort(today()).getAttribute('aria-label') === sort(today()).title, 'Time icon toggles to earliest-first with an accessible current-order label');
+    check(bodies(today())[0] === 'SORT NOTE 0' && bodies(today()).at(-1) === 'SORT NOTE 99', 'Today earliest-first uses the same timestamp for highlights and thoughts');
+    check(document.activeElement === sort(today()), 'Sort activation retains keyboard focus on its replacement action');
+    check(document.querySelector('.weread-journal-quote .weread-journal-note-text').textContent === quoteText, 'Changing list time order does not repick the featured quote');
+    view.contentEl.hidden = true; journal.publish({...state}); view.contentEl.hidden = false;
+    click('刷新笔记', view.contentEl); await tick();
+    check(sort(today()).dataset.sortOrder === 'asc' && bodies(today())[0] === 'SORT NOTE 0', 'Retained panel hide/show, cache publish and refresh preserve its time-order preference');
+    sort(today()).click();
+    check(bodies(today())[0] === 'SORT NOTE 104', 'Time sort toggles back to latest-first');
+
+    await mount('review');
+    const calendar = document.querySelector('.weread-journal-calendar');
+    const headerDate = document.querySelector('.weread-journal-today-date').textContent;
+    check(sort(results()).dataset.sortOrder === 'desc' && bodies(results())[0] === 'SORT NOTE 104', 'Review selected-day results default to latest-first');
+    document.querySelector('.weread-journal-day-list').scrollTop = 180;
+    click('再看 5 条', results());
+    check(bodies(results()).length === 105, 'Review next page is available before time-order reset');
+    sort(results()).click();
+    check(bodies(results()).length === 100 && bodies(results())[0] === 'SORT NOTE 0' && document.querySelector('.weread-journal-day-list').scrollTop === 0, 'Changing Review order resets pagination and only the note-list scroll');
+    const search = document.querySelector('input[type=search]'); search.value = 'SORT NOTE'; search.dispatchEvent(new Event('input'));
+    const filter = document.querySelector('select'); filter.value = 'thought'; filter.dispatchEvent(new Event('change'));
+    search.focus(); search.setSelectionRange(2, 5);
+    const retainedSearch = search, retainedFilter = filter;
+    sort(results()).click();
+    check(document.querySelector('input[type=search]') === retainedSearch && search.value === 'SORT NOTE' && search.selectionStart === 2 && search.selectionEnd === 5 && document.querySelector('select') === retainedFilter && filter.value === 'thought', 'Review sort retains search, selection and kind controls');
+    check(bodies(results())[0] === 'SORT NOTE 103' && bodies(results()).every(text => Number(text.replace('SORT NOTE ', '')) % 2 === 1), 'Search and kind filters compose with latest-first timestamp order');
+    search.value = ''; search.dispatchEvent(new Event('input')); filter.value = 'all'; filter.dispatchEvent(new Event('change'));
+    calendar.querySelector('button[aria-label^="2026-11-05，"]').click();
+    check(bodies(results()).join('|') === 'OLDER LATE|OLDER EARLY', 'Selected earlier day keeps the requested chronological order');
+    const selectedCalendar = document.querySelector('.weread-journal-calendar');
+    sort(results()).click();
+    check(bodies(results()).join('|') === 'OLDER EARLY|OLDER LATE' && bodies(document.querySelector('.weread-journal-anniversaries')).join('|') === 'ANNIVERSARY EARLY|ANNIVERSARY LATE', 'Review selected day and anniversaries share the chosen earliest-first order');
+    check(document.querySelector('.weread-journal-calendar') === selectedCalendar && document.querySelector('.weread-journal-day[aria-pressed=true]').getAttribute('aria-label').startsWith('2026-11-05，'), 'Time-order change preserves the calendar DOM and selected date');
+    check(document.querySelector('.weread-journal-today-date').textContent === headerDate && document.querySelector('input[type=month]').value === '2026-11', 'Sorting leaves the compact current date and calendar month unchanged');
+    check(cache.map(note => note.id).join('|') === cacheOrder && state.notes === cache, 'UI sorting never mutates or replaces the shared journal note cache');
+    journal.publish(previousState);
+    return assertions;
+  },
+  async anniversaryYears() {
+    const previousState = state, assertionStart = assertions.length;
+    const entries = [2025, 2024, 2023].flatMap((year, index) => [
+      note('year-early-' + year, 'a', index === 0 ? 'thought' : 'highlight', 'YEAR ' + year + ' EARLY', year + '-11-06T01:00:00Z'),
+      note('year-late-' + year, 'b', index === 1 ? 'thought' : 'highlight', 'YEAR ' + year + ' LATE', year + '-11-06T02:00:00Z')
+    ]);
+    journal.publish({...state, notes: [entries[3], entries[0], entries[5], entries[2], entries[1], entries[4]]});
+    await mount('review');
+    const past = () => view.contentEl.querySelector('.weread-journal-anniversaries');
+    const groups = () => [...past().querySelectorAll('.weread-journal-anniversary-year')];
+    const years = () => groups().map(group => group.dataset.year).join('|');
+    const bodies = root => [...root.querySelectorAll('article .weread-journal-note-text')].map(node => node.textContent);
+    const counts = () => groups().map(group => group.querySelector('.weread-journal-anniversary-year-count')?.textContent).join('|');
+    check(years() === '2025|2024|2023', 'Anniversaries: latest-first renders three distinct year groups');
+    check(groups().every(group => group.querySelector('h3.weread-journal-anniversary-year-heading')?.firstChild?.textContent.trim() === group.dataset.year + ' 年') && counts() === '2 条|2 条|2 条', 'Anniversaries: each year has its own heading and full matching count');
+    check(bodies(past()).join('|') === 'YEAR 2025 LATE|YEAR 2025 EARLY|YEAR 2024 LATE|YEAR 2024 EARLY|YEAR 2023 LATE|YEAR 2023 EARLY', 'Anniversaries: timestamps sort latest-first within every year across books and note kinds');
+    const renderedBodies = bodies(past());
+    check(renderedBodies.length === 6 && new Set(renderedBodies).size === 6 && entries.every(entry => renderedBodies.includes(entry.text)), 'Anniversaries: multiple books in a year produce no missing or duplicate notes');
+    check([...past().querySelectorAll('article')].every(card => card.querySelector('.weread-journal-source') && (!card.classList.contains('is-highlight') || card.querySelector('.weread-journal-favorite')) && card.querySelector('button[aria-label="复制正文"]') && card.querySelector('.weread-journal-note-meta a[aria-label]')), 'Anniversaries: grouped cards retain book, highlight favorite, copy and original actions');
+    click('复制正文', past()); await tick();
+    check(clipboardWrites.at(-1) === 'YEAR 2025 LATE', 'Anniversaries: grouped note copy acts on the correct note');
+    past().querySelector('.weread-journal-sort').click();
+    check(years() === '2023|2024|2025' && bodies(past()).join('|') === 'YEAR 2023 EARLY|YEAR 2023 LATE|YEAR 2024 EARLY|YEAR 2024 LATE|YEAR 2025 EARLY|YEAR 2025 LATE', 'Anniversaries: earliest-first reverses both year and within-year chronology');
+    const filter = view.contentEl.querySelector('select'); filter.value = 'thought'; filter.dispatchEvent(new Event('change'));
+    check(years() === '2024|2025' && counts() === '1 条|1 条' && bodies(past()).join('|') === 'YEAR 2024 LATE|YEAR 2025 EARLY', 'Anniversaries: kind filtering recalculates counts and removes empty years');
+    const search = view.contentEl.querySelector('input[type=search]'); search.value = 'YEAR 2025'; search.dispatchEvent(new Event('input'));
+    check(years() === '2025' && counts() === '1 条' && bodies(past())[0] === 'YEAR 2025 EARLY', 'Anniversaries: search composes with kind filtering and year counts');
+    search.value = 'NO MATCHING YEAR'; search.dispatchEvent(new Event('input'));
+    check(groups().length === 0 && !past().querySelector('article') && past().textContent.includes('往年今日暂无符合筛选的笔记'), 'Anniversaries: empty filters show the existing hint without empty year headings');
+    const bulk = [2025, 2024, 2023].flatMap(year => Array.from({length: 60}, (_, index) => ({...note('bulk-year-' + year + '-' + index, index % 2 ? 'a' : 'b', 'highlight', 'BULK ' + year + '-' + index, year + '-11-06T01:00:00Z'), createTime: RealDate.parse(year + '-11-06T01:00:00Z') + index * 60000})));
+    const cacheOrder = bulk.map(entry => entry.id).join('|');
+    journal.publish({...state, notes: bulk}); await mount('review');
+    const more = () => [...past().querySelectorAll('button')].filter(button => button.textContent.startsWith('再看 '));
+    check(years() === '2025|2024' && bodies(past()).length === 100 && counts() === '60 条|40 / 60 条', 'Anniversaries: one global 100-note limit spans years with a partial-year count');
+    check(bodies(groups()[0])[0] === 'BULK 2025-59' && bodies(groups()[1]).at(-1) === 'BULK 2024-20', 'Anniversaries: global pagination slices the chronologically ordered notes');
+    check(more().length === 1 && more()[0].textContent === '再看 80 条' && !more()[0].closest('.weread-journal-anniversary-year'), 'Anniversaries: exactly one load-more action outside year groups counts all remaining years');
+    more()[0].click();
+    const loadedIds = [...past().querySelectorAll('.weread-journal-favorite')].map(button => button.dataset.favoriteId);
+    check(years() === '2025|2024|2023' && bodies(past()).length === 180 && counts() === '60 条|60 条|60 条' && more().length === 0, 'Anniversaries: load more completes all years and their visible counts');
+    check(new Set(loadedIds).size === 180 && bulk.every(entry => loadedIds.includes(entry.id)), 'Anniversaries: pagination neither drops nor duplicates records across year boundaries');
+    past().querySelector('.weread-journal-sort').click();
+    check(years() === '2023|2024' && bodies(past()).length === 100 && counts() === '60 条|40 / 60 条' && bodies(past())[0] === 'BULK 2023-0' && bodies(past()).at(-1) === 'BULK 2024-39', 'Anniversaries: sort resets the global page and partial counts in earliest-first order');
+    check(state.notes === bulk && bulk.map(entry => entry.id).join('|') === cacheOrder, 'Anniversaries: grouping and pagination preserve shared cache order');
+    journal.publish(previousState);
+    return assertions.length - assertionStart;
+  },
+  async calendarHeatmap() {
+    window.calendarPreviousState = state;
+    const entries = [[1, 12], [3, 1], [4, 3], [5, 8], [6, 2]].flatMap(([day, count]) => Array.from({length: count}, (_, index) => note('heat-' + day + '-' + index, 'a', 'highlight', 'HEATMAP DAY ' + day + ' NOTE ' + index, '2026-11-' + String(day).padStart(2, '0') + 'T02:00:00Z')));
+    journal.publish({...state, notes: entries}); await mount('review');
+    const calendar = document.querySelector('.weread-journal-calendar');
+    const day = (date) => calendar.querySelector('button[aria-label^="2026-11-' + String(date).padStart(2, '0') + '，"]');
+    for (const [date, count] of [[1, 12], [2, 0], [3, 1], [4, 3], [5, 8], [6, 2]]) {
+      const button = day(date);
+      check(button.textContent.trim() === String(date) && !button.querySelector('small, .count, .weread-journal-day-count'), 'Calendar date ' + date + ' has no visible count badge or dot');
+      check(button.getAttribute('aria-label').includes(count + '条笔记') && button.title.includes(count + '条笔记'), 'Calendar date ' + date + ' retains exact note counts in accessible name and tooltip');
+      check(!button.disabled && button.tabIndex === 0, 'Past and current calendar dates remain keyboard reachable');
+    }
+    const activity = [2, 3, 4, 5, 1].map((date, intensity) => {
+      const button = day(date);
+      check(Number(button.dataset.noteIntensity) === intensity && Number(button.dataset.noteCount) === [0, 1, 3, 8, 12][intensity], 'Calendar activity metadata matches the real note count for date ' + date);
+      return {date, opacity: Number(getComputedStyle(button, '::before').opacity)};
+    });
+    check(activity[0].opacity === 0 && activity.every((entry, index) => index === 0 || entry.opacity > activity[index - 1].opacity), 'More notes produce a progressively stronger rendered calendar background');
+    check(day(6).getAttribute('aria-current') === 'date' && day(6).getAttribute('aria-pressed') === 'true', 'Heatmap preserves current-day and selected-day semantics');
+    check(day(7).disabled, 'Heatmap preserves disabled future days');
+    day(3).focus({preventScroll: true});
+    check(document.activeElement === day(3), 'Calendar date accepts keyboard focus before activation');
+  },
+  async calendarAfterKeyboard() {
+    const selected = document.querySelector('.weread-journal-day[aria-pressed="true"]');
+    check(selected?.getAttribute('aria-label').startsWith('2026-11-03，'), 'Enter activates the focused calendar date');
+    check(results().querySelectorAll('article').length === 1 && results().textContent.includes('HEATMAP DAY 3 NOTE 0'), 'Keyboard-selected date filters notes without changing their scope');
+    const search = document.querySelector('input[type=search]'); search.value = 'HEATMAP DAY 5'; search.dispatchEvent(new Event('input'));
+    check(results().querySelectorAll('article').length === 8, 'Calendar heatmap retains search across dates');
+    search.value = ''; search.dispatchEvent(new Event('input'));
+    check(results().querySelectorAll('article').length === 1, 'Clearing search restores the selected date');
+    document.querySelector('button[aria-label^="2026-11-02，"]').click();
+    check(!results().querySelector('article') && results().textContent.includes('这个范围内还没有笔记'), 'Zero-activity day remains selectable with an empty result');
+    journal.publish(window.calendarPreviousState); delete window.calendarPreviousState;
+    return assertions;
+  },
+  async favoritesPreview(mode = 'cards') {
+    await closeFavoritesPreview();
+    if (view) { await view.onClose(); view.contentEl.remove(); view = undefined; }
+    settingsStore.actions.setFavoritesViewMode(mode);
+    favorites.publish({
+      loaded: true, loading: false, writable: true, error: '', warning: '', pendingIds: [],
+      favorites: [baseNotes[0], baseNotes[2], baseNotes[4]].map((note, index) => ({
+        id: note.id, note: {...note}, favoritedAt: NOW - index * 86400000, updatedAt: NOW - index * 86400000
+      }))
+    });
+    const host = document.createElement('main'); document.body.append(host);
+    favoritesPreviewPanel = new WereadFavoritesPanel(host, plugin, favorites);
+    await favoritesPreviewPanel.onOpen();
+    if (mode === 'list') host.querySelector('.weread-favorites-summary').click();
+    await tick();
+    check(host.querySelectorAll('article').length === 3 && host.querySelector('.is-' + mode), 'Favorites preview mounts three realistic records in ' + mode);
+    check(document.documentElement.scrollWidth <= innerWidth, 'Favorites ' + mode + ' preview fits its viewport');
+  },
+  async closeFavoritesPreview() { await closeFavoritesPreview(); },
+  async today() {
+    await mount('today');
+    check(!view.contentEl.querySelector('h1'), 'Today removes the large title for a compact single header row');
+    const heading = view.contentEl.querySelector('.weread-journal-heading');
+    const date = heading.querySelector('.weread-journal-today-date');
+    const status = heading.querySelector('.weread-journal-status');
+    const refresh = heading.querySelector('button[aria-label="刷新笔记"]');
+    check(date?.textContent === new Date().toLocaleDateString('zh-CN', {year: 'numeric', month: 'long', day: 'numeric', weekday: 'long'}) && !view.contentEl.querySelector('.weread-journal-body > .weread-journal-muted'), 'Today shows the full local date exactly once in its header');
+    check(status && refresh?.title === '刷新笔记' && refresh.textContent === '' && refresh.querySelector('svg[data-icon="refresh-cw"]'), 'Cache status and an accessible icon-only refresh action share the header');
+    const assertHeaderRow = () => {
+      const d = date.getBoundingClientRect(), s = status.getBoundingClientRect(), r = refresh.getBoundingClientRect();
+      check(d.left < s.left && s.right <= r.left && Math.abs((d.top + d.height / 2) - (r.top + r.height / 2)) < 2 && heading.getBoundingClientRect().height < 40, 'Today date, cache status and rightmost refresh stay in one compact row at width ' + innerWidth);
+      check(r.width >= 24 && Math.abs(refresh.querySelector('svg').getBoundingClientRect().width - 16) < 1 && document.documentElement.scrollWidth <= innerWidth, 'Compact refresh keeps a usable target and 16px icon without horizontal overflow');
+    };
+    assertHeaderRow();
+    const beforeHeaderState = state;
+    journal.publish({...state, error: '加载失败，请重试。'.repeat(30)});
+    check(status.title === status.textContent && status.getAttribute('aria-label') === status.textContent && getComputedStyle(status).textOverflow === 'ellipsis', 'Truncated cache and error information remains available in full through tooltip and accessible label');
+    assertHeaderRow(); journal.publish(beforeHeaderState);
+    const originalLoad = journal.load;
+    const refreshGate = gate(); const refreshForces = [];
+    journal.load = async force => { refreshForces.push(force); await refreshGate.promise; return state; };
+    refresh.click(); await tick(); refresh.click();
+    check(refresh.disabled && refreshForces.length === 1 && refreshForces[0] === true, 'Refresh icon forces a manual update and prevents duplicate pending loads');
+    refreshGate.resolve(); await tick(); journal.load = originalLoad;
+    check(!refresh.disabled, 'Refresh icon becomes available again after the update completes');
+    journal.load = async () => { throw new Error('REFRESH FAILURE FIXTURE'); };
+    refresh.click(); await tick(); journal.load = originalLoad;
+    check(!refresh.disabled && window.journalNotices.at(-1) === 'REFRESH FAILURE FIXTURE', 'Failed refresh keeps its notice and allows retry from the same icon');
+    check(document.body.textContent.includes('1小时1分钟'), 'Today reads local-day duration');
+    check(document.querySelector('.weread-journal-summary').textContent.includes('今日划线1 条'), 'Today counts highlight after UTC midnight boundary');
+    const completeState = { ...state, syncing: false, failedBooks: 0, error: '' };
+    const metricCards = () => [...document.querySelector('.weread-journal-today-metrics-grid').children];
+    journal.publish({ ...completeState, notes: [], syncing: true, scannedBooks: 428, totalBooks: 565 });
+    check(refresh.disabled && status.textContent.includes('正在更新 428/565 本'), 'Background syncing disables refresh and retains visible cache coverage');
+    check(metricCards().slice(1).every(card => card.querySelector('strong').textContent === '0 条'), 'Partial zero counts contain only numbers and units');
+    check(metricCards().slice(1).every(card => card.querySelector('small.weread-journal-metric-status')?.textContent === '统计中，当前为部分结果'), 'In-progress counts explain partial coverage below the value');
+    check(!metricCards()[0].querySelector('.weread-journal-metric-status'), 'Note coverage does not qualify the independent reading duration');
+    check(metricCards().slice(1).every(card => parseFloat(getComputedStyle(card.querySelector('small')).fontSize) < parseFloat(getComputedStyle(card.querySelector('strong')).fontSize)), 'Coverage uses smaller type than the metric value');
+    journal.publish({ ...completeState, notes: [], syncing: false, failedBooks: 1 });
+    check(metricCards().slice(1).every(card => card.querySelector('strong').textContent === '0 条' && card.querySelector('small')?.textContent === '部分书籍加载失败，当前为部分结果'), 'Failed coverage stays distinct from a complete zero count');
+    journal.publish({ ...completeState, notes: [], hasCache: false, syncing: true });
+    check(metricCards().slice(1).every(card => card.querySelector('strong').textContent === '加载中…'), 'No initial cache never claims a known zero');
+    journal.publish(completeState);
+    check(!document.querySelector('.weread-journal-metric-status'), 'Complete successful statistics remove partial-result hints');
+    const traces = document.querySelector('.weread-journal-today-notes');
+    check(cards(traces).some((text) => text.includes('晨光穿过树叶')), 'Today renders local-day highlight');
+    check(!cards(traces).some((text) => text.includes('昨日句子') || text.includes('FUTURE SENTINEL')), 'Today notes exclude yesterday and future notes');
+    const summary = document.querySelector('.weread-journal-summary');
+    const metrics = summary.querySelector('.weread-journal-today-metrics');
+    check(summary.children.length === 2 && metrics.querySelector('.weread-journal-today-metrics-grid').children.length === 3 && summary.lastElementChild.classList.contains('weread-journal-today-books'), 'Today overview groups three metrics and books into two halves');
+    check(metrics.querySelector('span').textContent === '阅读时长', 'Duration uses the requested reading-only label');
+    const titles = [...summary.querySelectorAll('.weread-journal-today-book-list .weread-journal-source')].map((node) => node.textContent);
+    check(JSON.stringify(titles) === JSON.stringify(['《新书》', '《山间的阅读》', '《第三本今日书》']), 'Today books are sorted by recency and limited to the latest three');
+    check(!summary.textContent.includes('OLDER BOOK SENTINEL') && !summary.textContent.includes('FOURTH BOOK SENTINEL'), 'Older same-day books are omitted');
+    if (innerWidth > 1000) {
+      const left = metrics.getBoundingClientRect(), right = summary.lastElementChild.getBoundingClientRect();
+      check(left.width < right.width && Math.abs(left.top - right.top) < 1, 'Metrics card is narrower than the books card');
+      const list = summary.querySelector('.weread-journal-today-book-list');
+      check(Math.abs(list.lastElementChild.getBoundingClientRect().right - list.getBoundingClientRect().right) < 1, 'Book cards fill the available width without unused right-side space');
+      const links = [...summary.querySelectorAll('.weread-journal-original')].map(node => node.getBoundingClientRect());
+      check(links.length === 3 && links.every(rect => Math.abs(rect.bottom - links[0].bottom) < 1), 'Reading links align at the bottom despite different title lengths');
+      check(metrics.querySelector('.weread-journal-today-metrics-grid').getBoundingClientRect().left > left.left, 'Metrics are inset inside their own card');
+    }
+    const quote = () => document.querySelector('.weread-journal-quote');
+    check(quote().querySelector('h2').textContent === '旧句重逢' && !quote().textContent.includes('晨光穿过树叶'), 'Today quote reencounters a past highlight even when today has a highlight');
+    click('换一句', quote());
+    check(!quote().textContent.includes('晨光穿过树叶'), 'Change quote stays among past highlights');
+    click('换一本', quote());
+    check(quote().textContent.includes('城市记忆') && quote().querySelector('h2').textContent === '旧句重逢', 'Change book also keeps the old-quote scope');
+    const metadata = quote().querySelector('.weread-journal-note-meta');
+    check(metadata.children[0].tagName === 'SMALL' && metadata.children[1].classList.contains('weread-journal-note-actions') && metadata.children[1].querySelector('a') && metadata.children[1].querySelector('button'), 'Full note time precedes one group of original and copy actions');
+    const tools = metadata.querySelector('.weread-journal-note-actions');
+    const toolRects = [...tools.children].map(node => node.getBoundingClientRect());
+    check(Math.abs(tools.getBoundingClientRect().right - metadata.getBoundingClientRect().right) < 1 && toolRects.every(rect => Math.abs(rect.top - toolRects[0].top) < 1), 'Note tools align together at the metadata right edge without splitting rows');
+    check(metadata.querySelector('a[aria-label] svg') && metadata.querySelector('button[aria-label="复制正文"] svg'), 'Actions have icons and accessible names');
+    check(!quote().querySelector('.weread-journal-original'), 'Text footer link is removed from note cards');
+    const copy = metadata.querySelector('button');
+    copy.click(); await tick();
+    check(clipboardWrites.at(-1) === quote().querySelector('.weread-journal-note-text').textContent && window.journalNotices.at(-1) === '已复制', 'Copy writes the exact body and confirms success');
+    clipboardFails = true; const written = clipboardWrites.length; copy.click(); await tick(); clipboardFails = false;
+    check(clipboardWrites.length === written && window.journalNotices.at(-1) === '复制失败，请重试', 'Clipboard failure gives feedback without claiming success');
+    check(!document.body.textContent.includes('YESTERDAY BOOK SENTINEL'), 'Today shelf excludes previous local day');
+    check(document.querySelector('.weread-journal-today-notes a[aria-label="打开书籍"]')?.href === getPcUrl('a'), 'Original source links retain the safe own-book web reader URL');
+    return assertions;
+  },
+  async review() {
+    await mount('review');
+    const heading = view.contentEl.querySelector('.weread-journal-heading');
+    const headerDate = heading.querySelector('.weread-journal-today-date');
+    const headerStatus = heading.querySelector('.weread-journal-status');
+    const refresh = heading.querySelector('button[aria-label="刷新笔记"]');
+    const dateText = new Date().toLocaleDateString('zh-CN', {year: 'numeric', month: 'long', day: 'numeric', weekday: 'long'});
+    check(!view.contentEl.querySelector('h1') && headerDate.textContent === dateText, 'Review uses the same compact actual-today date header without a large title');
+    const d = headerDate.getBoundingClientRect(), r = refresh.getBoundingClientRect();
+    check(headerStatus && refresh.textContent === '' && refresh.title === '刷新笔记' && d.right <= headerStatus.getBoundingClientRect().left && headerStatus.getBoundingClientRect().right <= r.left && Math.abs((d.top + d.height / 2) - (r.top + r.height / 2)) < 2 && heading.getBoundingClientRect().height < 40, 'Review keeps date, cache info and rightmost refresh icon in one row at width ' + innerWidth);
+    check(document.body.textContent.includes('去年今日'), 'Review includes anniversary thought');
+    const quote = document.querySelector('.weread-journal-quote');
+    const before = quote.querySelector('article').textContent;
+    click('换一句', quote);
+    check(document.querySelector('.weread-journal-quote article').textContent !== before, 'Quote changes within same book');
+    click('换一本', document.querySelector('.weread-journal-quote'));
+    check(document.querySelector('.weread-journal-quote article').textContent.includes('城市与记忆'), 'Quote changes book');
+    let search = document.querySelector('input[type=search]');
+    search.value = '城市记忆'; search.dispatchEvent(new Event('input'));
+    check(cards(results()).length === 1 && cards(results())[0].includes('城市记忆'), 'Search finds cached notes across dates');
+    search.focus(); search.setSelectionRange(1, 3);
+    journal.publish({ ...state, syncing: true });
+    search = document.querySelector('input[type=search]');
+    check(document.activeElement === search && search.selectionStart === 1 && search.selectionEnd === 3, 'Search focus and selection survive cache progress');
+    search.value = ''; search.dispatchEvent(new Event('input'));
+    const day = document.querySelector('button[aria-label^="2026-11-05，"]'); day.click();
+    check(headerDate.textContent === dateText, 'Review selected day remains independent of the header current date');
+    check(cards(results()).filter((text) => !text.includes('去年今日')).length === 2 && cards(results()).filter((text) => !text.includes('去年今日')).every((text) => text.includes('旧句') || text.includes('昨日句子')), 'Calendar day selection filters local dates');
+    const select = document.querySelector('select'); select.value = 'thought'; select.dispatchEvent(new Event('change'));
+    check(cards(results()).length === 0 && results().textContent.includes('这个范围内还没有笔记') && cards(document.querySelector('.weread-journal-anniversaries')).every((text) => text.includes('去年今日')), 'Kind filter applies to selected calendar day and separate anniversaries');
+    select.value = 'all'; select.dispatchEvent(new Event('change'));
+    journal.publish({ ...state, syncing: false, failedBooks: 1, error: '1 本书未完整获取' });
+    check(document.querySelector('.weread-journal-status').textContent.includes('1 本未完整获取'), 'Partial state is visible beside cached content');
+    return assertions;
+  },
+  async layout() {
+    await mount('review');
+    const calendar = document.querySelector('.weread-journal-calendar');
+    const box = calendar.getBoundingClientRect();
+    check(box.width <= 261 && results().getBoundingClientRect().left >= box.right, 'Desktop uses compact left calendar and right notes');
+    const day = calendar.querySelector('.weread-journal-day');
+    check(day.getBoundingClientRect().width <= 36 && day.getBoundingClientRect().height <= 42, 'Calendar days stay compact under host button styles');
+    check(getComputedStyle(document.querySelector('.weread-journal-today-date')).fontFamily.includes('Songti SC') && getComputedStyle(document.querySelector('.weread-journal-note-text')).fontFamily.includes('Songti SC'), 'Reference serif stack is applied to heading and reading prose');
+    check(Boolean(document.querySelector('.weread-journal-retro-grid').compareDocumentPosition(document.querySelector('.weread-journal-quote')) & Node.DOCUMENT_POSITION_FOLLOWING), 'Calendar and notes precede the featured quote');
+    check(calendar.querySelector('button[aria-label^="2026-11-07，"]').disabled, 'Future calendar dates are disabled');
+    calendar.querySelector('button[aria-label="上个月"]').click();
+    check(document.querySelector('input[type=month]').value === '2026-10', 'Previous month uses compact navigation');
+    click('回到今天');
+    check(document.querySelector('input[type=month]').value === '2026-11' && document.querySelector('.weread-journal-day[aria-current=date]').getAttribute('aria-pressed') === 'true', 'Back to today restores current month and selection');
+    const jump = document.querySelector('input[type=month]'); jump.value = '2025-11'; jump.dispatchEvent(new Event('change'));
+    check(document.querySelector('input[type=month]').value === '2025-11', 'Month picker jumps directly to an earlier year');
+    click('最近笔记日');
+    check(document.querySelector('input[type=month]').value === '2026-11', 'Latest note shortcut returns to latest non-future note month');
+    return assertions;
+  },
+  async favorites() {
+    await mount('review');
+    const search = document.querySelector('input[type=search]');
+    search.value = '昨日句子'; search.dispatchEvent(new Event('input'));
+    const stars = () => [...document.querySelectorAll('.weread-journal-favorite')].filter(star => star.dataset.favoriteId === baseNotes[2].id);
+    check(stars().length === 2, 'Same source highlight has stars in search and featured quote');
+    check(!document.querySelector('.is-thought .weread-journal-favorite'), 'Thoughts never show favorites');
+    const quote = document.querySelector('.weread-journal-quote article');
+    const prose = quote.querySelector('.weread-journal-note-text');
+    const loads = journalLoads;
+    const pending = gate(); favoriteWriteGate = pending;
+    const first = stars()[0]; first.click(); await tick();
+    check(stars().every(star => star.disabled && star.getAttribute('aria-pressed') === 'false'), 'Stars disable while disk acknowledgement is pending without false success');
+    pending.resolve(); await tick(); favoriteWriteGate = undefined;
+    check(stars().every(star => !star.disabled && star.getAttribute('aria-pressed') === 'true'), 'Acknowledged favorite appears in both copies');
+    check(document.querySelector('.weread-journal-quote article') === quote && quote.querySelector('.weread-journal-note-text') === prose && journalLoads === loads, 'Favorite mutation preserves quote DOM and does not reload journal');
+    check(window.journalNotices.at(-1) === '已收藏', 'Favorite success notice follows disk acknowledgement');
+    first.click(); await tick();
+    check(stars().every(star => star.getAttribute('aria-pressed') === 'false') && document.querySelector('.weread-favorites-undo'), 'Cancel updates both stars and offers undo');
+    click('撤销'); await tick();
+    check(stars().every(star => star.getAttribute('aria-pressed') === 'true'), 'Journal undo restores both stars');
+    first.click(); await tick();
+    favoriteWriteFails = true; first.click(); await tick(); favoriteWriteFails = false;
+    check(stars().every(star => star.getAttribute('aria-pressed') === 'false') && window.journalNotices.at(-1) === 'FAKE DISK WRITE FAILED', 'Disk failure keeps star inactive and surfaces error');
+    favorites.publish({writable: false, error: 'READ ONLY FIXTURE'});
+    check(stars().every(star => star.disabled && star.title === 'READ ONLY FIXTURE'), 'Read-only stars explain the storage error');
+    favorites.publish({writable: true, error: ''});
+    await view.onClose(); view.contentEl.remove(); view = undefined;
+    check(favoriteListeners.size === 0, 'Journal closes its sole favorites subscription');
+    const favoriteEntries = [baseNotes[0], baseNotes[2], baseNotes[4]].map((note, index) => ({id: note.id, note, favoritedAt: NOW + index * 1000, updatedAt: NOW + index * 1000}));
+    favorites.publish({favorites: favoriteEntries, error: ''});
+    const offlineApiCalls = apiCalls, offlineJournalLoads = journalLoads;
+    const host = document.createElement('main'); document.body.append(host);
+    let panel = new WereadFavoritesPanel(host, plugin, favorites); await panel.onOpen();
+    check(host.querySelector('.is-cards') && host.querySelectorAll('article').length === 3 && host.querySelector('article').dataset.favoriteId === baseNotes[4].id, 'Favorites default to cards sorted by latest favorite');
+    check(host.querySelector('.weread-favorites-cover') && host.textContent.includes('划线于') && host.textContent.includes('收藏于'), 'Cards show cover and separate source/favorite dates');
+    const sort = host.querySelector('button[aria-label="按收藏时间从新到旧排序"]'); sort.click();
+    check([...host.querySelectorAll('article')].map(card => card.dataset.favoriteId).join('|') === favoriteEntries.map(entry => entry.id).join('|') && sort.getAttribute('aria-label') === '按收藏时间从旧到新排序', 'Favorite-time toggle orders all records oldest first and exposes current direction');
+    sort.click();
+    check([...host.querySelectorAll('article')].map(card => card.dataset.favoriteId).join('|') === [...favoriteEntries].reverse().map(entry => entry.id).join('|') && sort.getAttribute('aria-label') === '按收藏时间从新到旧排序', 'Favorite-time toggle returns all records to latest first');
+    const query = host.querySelector('input');
+    for (const term of ['城市记忆', '城市与记忆', '周行']) {
+      query.value = term; query.dispatchEvent(new Event('input'));
+      check(host.querySelectorAll('article').length === 1, 'Local favorites search covers ' + term);
+    }
+    query.value = '在日常里发现光'; query.dispatchEvent(new Event('input'));
+    check(host.querySelectorAll('article').length === 3, 'Favorites search includes chapter');
+    query.value = '<script>not present</script>'; query.dispatchEvent(new Event('input'));
+    check(host.querySelectorAll('article').length === 0 && host.textContent.includes('没有找到'), 'Search explains no matching favorites');
+    query.value = ''; query.dispatchEvent(new Event('input'));
+    click('列表视图', host);
+    check(host.querySelector('.is-list') && settingsStore.current().favoritesViewMode === 'list', 'List mode is saved through settings action');
+    const summary = host.querySelector('.weread-favorites-summary'); summary.click();
+    check(summary.getAttribute('aria-expanded') === 'true' && !summary.nextElementSibling.hidden && summary.textContent === '收起全文', 'List expansion shows the full body once with a collapse control');
+    const previous = favoriteState.favorites.find(entry => entry.id === host.querySelector('article').dataset.favoriteId);
+    host.querySelector('button[aria-label="取消收藏"]').click(); await tick();
+    check(!favorites.isFavorite(previous.id) && host.querySelector('.weread-favorites-undo'), 'Panel removal offers five-second undo');
+    const staleUndo = host.querySelector('.weread-favorites-undo button');
+    click('撤销', host); await tick();
+    check(favorites.isFavorite(previous.id) && favoriteState.favorites.find(entry => entry.id === previous.id).favoritedAt === previous.favoritedAt, 'Undo restores the precise favorite timestamp');
+    host.querySelector('button[aria-label="取消收藏"]').click(); await tick();
+    const writes = favoriteWrites; staleUndo.click(); await tick();
+    check(favoriteWrites === writes, 'Detached earlier undo cannot restore the wrong later removal');
+    click('撤销', host); await tick();
+    const canvasButton = () => host.querySelector('button[aria-label="在Canvas中打开收藏"]');
+    check(canvasButton()?.title.includes('收藏保存在当前笔记库的Canvas，可直接打开整理卡片。'), 'Accessible native Canvas action explains storage through its tooltip');
+    check(favoriteLoads.at(-1) === true, 'Opening the panel rereads serialized Canvas data');
+    const canvasPending = gate(); canvasEnsureGate = canvasPending;
+    const ensureCalls = canvasEnsureCalls, opensBefore = canvasOpens.length;
+    click('在Canvas中打开收藏', host); await tick();
+    canvasButton().click(); await tick();
+    check(canvasButton().disabled && canvasEnsureCalls === ensureCalls + 1 && canvasOpens.length === opensBefore, 'Canvas opening stays pending without duplicate ensures or opening before file acknowledgement');
+    canvasPending.resolve(); await tick(); canvasEnsureGate = undefined;
+    check(JSON.stringify(canvasOpens.at(-1)) === JSON.stringify(['WereadData/favorites/favorites.canvas', '', true]) && !canvasButton().disabled, 'Canvas action opens the vault-relative native Canvas in a new leaf through the public workspace API');
+    canvasEnsureFails = true; click('在Canvas中打开收藏', host); await tick(); canvasEnsureFails = false;
+    check(window.journalNotices.at(-1) === 'CANVAS ENSURE FAILED FIXTURE' && canvasOpens.length === opensBefore + 1 && !canvasButton().disabled, 'Canvas file failure reports an error and permits retry without opening');
+    canvasOpenFails = true; click('在Canvas中打开收藏', host); await tick(); canvasOpenFails = false;
+    check(window.journalNotices.at(-1) === 'CANVAS OPEN FAILED FIXTURE' && !canvasButton().disabled, 'Workspace Canvas opening failure reports an error and resets pending state');
+    favorites.publish({writable: false, warning: 'RECOVERY WARNING FIXTURE', error: 'READ ONLY FIXTURE'});
+    check(host.querySelectorAll('article').length === 3 && host.querySelector('button[aria-label="取消收藏"]').disabled && host.textContent.includes('RECOVERY WARNING FIXTURE') && host.textContent.includes('只读'), 'Read-only mode preserves records and explains recovery warnings');
+    check(canvasButton().disabled && canvasButton().title === 'READ ONLY FIXTURE', 'Read-only favorites disable native Canvas opening and explain why');
+    favorites.publish({writable: true, warning: '', error: '', favorites: []});
+    check(host.textContent.includes('还没有收藏'), 'Empty collection explains where to add favorites');
+    click('在Canvas中打开收藏', host); await tick();
+    check(canvasOpens.length === opensBefore + 2, 'Loaded writable empty favorites can open their native Canvas');
+    const longNote = {...baseNotes[0], text: '<img src=x onerror=alert(1)> ' + '长句'.repeat(300)};
+    favorites.publish({favorites: Array.from({length: 35}, (_, index) => ({id: 'page:' + index, note: {...longNote, id: 'page:' + index}, favoritedAt: NOW + index, updatedAt: NOW}))});
+    click('卡片视图', host);
+    check(host.querySelectorAll('article').length === 30 && !host.querySelector('.weread-favorites-text img'), 'Favorites page size is 30 and note text cannot inject HTML');
+    click('再看 5 条', host); check(host.querySelectorAll('article').length === 35, 'Load more reveals remaining local favorites');
+    check(document.documentElement.scrollWidth <= innerWidth, 'Favorites fit the mobile viewport without horizontal overflow');
+    const lateCanvas = gate(); canvasEnsureGate = lateCanvas;
+    click('在Canvas中打开收藏', host); await tick();
+    const opensAtClose = canvasOpens.length, noticesAtClose = window.journalNotices.length;
+    await panel.onClose();
+    const closed = host.innerHTML; favorites.publish({favorites: []});
+    lateCanvas.resolve(); await tick(); canvasEnsureGate = undefined;
+    check(canvasOpens.length === opensAtClose && window.journalNotices.length === noticesAtClose && host.innerHTML === closed, 'Closing while Canvas ensure is pending prevents late workspace opening, notices and DOM writes');
+    check(favoriteListeners.size === 0 && host.innerHTML === closed && !host.querySelector('.weread-favorites-undo'), 'Panel close removes its subscription and prevents later DOM writes');
+    panel = new WereadFavoritesPanel(host, plugin, favorites); await panel.onOpen();
+    check(host.querySelector('button[aria-label="卡片视图"]').getAttribute('aria-pressed') === 'true', 'Panel reopens using saved view preference');
+    await panel.onClose();
+    check(apiCalls === offlineApiCalls && journalLoads === offlineJournalLoads, 'Favorites panel interactions never call APIs or load the journal');
+    const hydration = gate();
+    favorites.publish({loaded: false, loading: true, writable: false});
+    const loadingFavorites = {...favorites, load: () => hydration.promise};
+    panel = new WereadFavoritesPanel(host, plugin, loadingFavorites);
+    const opening = panel.onOpen(); await tick();
+    check(host.textContent.includes('正在读取本地收藏') && host.querySelector('button[aria-label="在Canvas中打开收藏"]').disabled, 'Hydration shows loading and disables Canvas opening until records are loaded');
+    await panel.onClose(); const closedLoading = host.innerHTML;
+    favorites.publish({loaded: true, loading: false, error: 'HYDRATION FAILED FIXTURE', writable: false});
+    hydration.resolve(favoriteState); await opening;
+    check(host.innerHTML === closedLoading && favoriteListeners.size === 0, 'Closing during favorites hydration prevents late DOM writes and subscriptions');
+    panel = new WereadFavoritesPanel(host, plugin, favorites); await panel.onOpen();
+    check(host.textContent.includes('HYDRATION FAILED FIXTURE') && host.textContent.includes('只读'), 'Hydration error is visible with meaningful read-only recovery state');
+    click('重新读取收藏', host);
+    check(favoriteLoads.at(-1) === true, 'Read-only recovery forces a fresh read of serialized Canvas data');
+    favorites.publish({favorites: favoriteEntries, writable: true, error: ''});
+    check(host.querySelectorAll('article').length === 3 && !host.textContent.includes('HYDRATION FAILED FIXTURE'), 'Recovery publishes usable records and clears hydration error');
+    await mount('review');
+    const liveSearch = view.contentEl.querySelector('input[type=search]');
+    liveSearch.value = '昨日句子'; liveSearch.dispatchEvent(new Event('input'));
+    const nativeDeletedStars = () => [...view.contentEl.querySelectorAll('.weread-journal-favorite')].filter(star => star.dataset.favoriteId === baseNotes[2].id);
+    check(nativeDeletedStars().length === 2 && nativeDeletedStars().every(star => star.getAttribute('aria-pressed') === 'true'), 'Live Canvas reload fixture starts with the native-deleted record starred in both journal copies');
+    const nativeEditedText = 'CANVAS LIVE EDIT: 整理卡片后的新正文';
+    favorites.publish({favorites: favoriteEntries.filter(entry => entry.id !== baseNotes[2].id).map(entry => entry.id === baseNotes[0].id ? {...entry, note: {...entry.note, text: nativeEditedText}} : entry)});
+    check(host.querySelectorAll('article').length === 2 && host.querySelector('.is-cards') && host.textContent.includes(nativeEditedText) && !host.querySelector('article[data-favorite-id="' + baseNotes[2].id + '"]'), 'Live native Canvas publish refreshes the favorites layout with edited note text and removes the native-deleted record');
+    check(nativeDeletedStars().every(star => star.getAttribute('aria-pressed') === 'false' && !star.disabled), 'Live native Canvas deletion refreshes all journal stars without remounting');
+    await panel.onClose(); host.remove();
+    const service = plugin.favoritesService; delete plugin.favoritesService;
+    await mount('review'); check(!document.querySelector('.weread-journal-favorite'), 'Legacy plugin fixtures work without favorites service');
+    plugin.favoritesService = service;
+    await view.onClose(); view.contentEl.remove(); view = undefined;
+    return assertions;
+  },
+  async exclusions() {
+    const extended = [...baseNotes,
+      note('other-two', 'b', 'highlight', '城市第二句', '2026-11-03T02:00:00Z'),
+      note('third-book', 'c', 'highlight', '第三本旧句', '2026-11-02T02:00:00Z')
+    ];
+    for (const mode of ['today', 'review']) {
+      journal.publish({...state, notes: extended});
+      settingsStore.actions.setJournalExcludedBookIds(['b', 'c']);
+      await mount(mode);
+      const quote = () => view.contentEl.querySelector('.weread-journal-quote');
+      const quoteId = () => quote().querySelector('.weread-journal-favorite')?.dataset.favoriteId;
+      const button = label => [...quote().querySelectorAll('button')].find(node => node.textContent === label);
+      check(quoteId()?.startsWith('a:'), mode + ': initial quote respects existing excluded books');
+      const ordinary = view.contentEl.querySelector(mode === 'today' ? '.weread-journal-today-notes' : '.weread-journal-day-notes');
+      const calendar = view.contentEl.querySelector('.weread-journal-calendar');
+      let search, filter, month, selectedDay, calendarHtml;
+      if (mode === 'review') {
+        month = view.contentEl.querySelector('input[type=month]'); month.value = '2026-10'; month.dispatchEvent(new Event('change'));
+        view.contentEl.querySelector('button[aria-label^="2026-10-05，"]').click();
+        search = view.contentEl.querySelector('input[type=search]'); search.value = '昨日句子'; search.dispatchEvent(new Event('input'));
+        filter = view.contentEl.querySelector('select'); filter.value = 'highlight'; filter.dispatchEvent(new Event('change'));
+        month = view.contentEl.querySelector('input[type=month]');
+        selectedDay = view.contentEl.querySelector('.weread-journal-day.is-selected');
+        calendarHtml = view.contentEl.querySelector('.weread-journal-calendar').innerHTML;
+        filter.focus();
+      }
+      const retainedResults = view.contentEl.querySelector(mode === 'today' ? '.weread-journal-today-notes' : '.weread-journal-day-notes');
+      const notesHtml = retainedResults.innerHTML;
+      const loadsBefore = journalLoads, callsBefore = apiCalls, writesBefore = favoriteWrites;
+      settingsStore.actions.setJournalExcludedBookIds(['a']);
+      await tick();
+      check(quoteId()?.startsWith('b:'), mode + ': excluding selected book immediately replaces its quote');
+      check(retainedResults.isConnected && retainedResults.innerHTML === notesHtml, mode + ': ordinary notes from excluded books remain visible and retain DOM');
+      if (mode === 'today') {
+        check(quote().nextElementSibling === ordinary, 'Today: quote replacement keeps its position before today notes');
+        check(ordinary.textContent.includes('晨光穿过树叶'), 'Today: exclusion does not hide ordinary today highlights');
+      } else {
+        check(search.isConnected && search.value === '昨日句子' && filter.isConnected && filter.value === 'highlight' && document.activeElement === filter, 'Review: exclusion preserves search, kind and focused control');
+        check(month.isConnected && month.value === '2026-10' && selectedDay.isConnected && selectedDay.classList.contains('is-selected') && calendarHtml === view.contentEl.querySelector('.weread-journal-calendar').innerHTML, 'Review: exclusion preserves visible month, selected date and calendar DOM');
+        check(retainedResults.textContent.includes('昨日句子'), 'Review: excluded book remains searchable');
+        search.focus(); settingsStore.actions.setJournalExcludedBookIds(['a', 'a']);
+        check(document.activeElement === search && search.isConnected, 'Review: equivalent IDs preserve focused search');
+      }
+      const beforeChange = quoteId(); click('换一句', quote());
+      check(quoteId()?.startsWith('b:') && quoteId() !== beforeChange, mode + ': change quote uses eligible same-book highlights');
+      click('换一本', quote());
+      check(quoteId()?.startsWith('c:'), mode + ': change book never selects the excluded book');
+      click('换一本', quote());
+      check(quoteId()?.startsWith('b:'), mode + ': repeated change book stays eligible');
+      check(journalLoads === loadsBefore && apiCalls === callsBefore && favoriteWrites === writesBefore, mode + ': preferences and quote changes trigger no journal reload, API call or favorite write');
+      journal.publish({...state, notes: [...extended], syncing: true}); await tick();
+      journal.publish({...state, notes: [...extended], syncing: false}); await tick();
+      check(!quoteId()?.startsWith('a:'), mode + ': async cache publications never reintroduce excluded quotes');
+      click('刷新笔记', view.contentEl); await tick();
+      check(!quoteId()?.startsWith('a:'), mode + ': explicit refresh never reintroduces excluded quotes');
+      const loadsAfterRefresh = journalLoads, callsAfterRefresh = apiCalls;
+      settingsStore.actions.setJournalExcludedBookIds(['a', 'b', 'c']);
+      check(!quote().querySelector('article') && quote().textContent.includes('设置') && button('换一句').disabled && button('换一本').disabled, mode + ': all excluded shows helpful settings hint and disables both change buttons');
+      journal.publish({...state, notes: extended}); await tick();
+      check(!quote().querySelector('article'), mode + ': all-excluded cache publication cannot fall back to excluded notes');
+      settingsStore.actions.setJournalExcludedBookIds(['b', 'c']);
+      check(quoteId()?.startsWith('a:') && !button('换一句').disabled && button('换一本').disabled, mode + ': including a book restores eligibility and correct change controls');
+      settingsStore.actions.setJournalExcludedBookIds([]);
+      check(!button('换一本').disabled, mode + ': empty exclusions restore other-book selection');
+      check(journalLoads === loadsAfterRefresh && apiCalls === callsAfterRefresh, mode + ': exclusion and inclusion updates never reset network data');
+      for (const malformed of [undefined, null, 'a', {}, [null, {}, true]]) {
+        settingsStore.set({...settingsStore.current(), journalExcludedBookIds: malformed});
+        check(!!quoteId(), mode + ': missing or malformed exclusion fixture remains backward compatible');
+      }
+      settingsStore.actions.setJournalExcludedBookIds([]);
+    }
+    journal.publish({...state, notes: baseNotes});
+    await view.onClose(); view.contentEl.remove(); view = undefined;
+  },
+  async reencounterControls() {
+    const assertionStart = assertions.length;
+    const ordinary = baseNotes.map(entry => ({...entry, bookType: 0}));
+    const articles = [
+      {...note('article-one', 'mp', 'highlight', 'ARTICLE SENTINEL 第一条公众号旧句', '2026-11-05T04:00:00Z'), bookType: 3, bookTitle: '合成公众号'},
+      {...note('article-two', 'mp', 'highlight', 'ARTICLE SENTINEL 第二条公众号旧句', '2026-11-04T04:00:00Z'), bookType: 3, bookTitle: '合成公众号'}
+    ];
+    const notes = [...ordinary, ...articles, {...note('other-two', 'b', 'highlight', '城市另一条旧句', '2026-11-03T02:00:00Z'), bookType: 0}];
+    for (const mode of ['today', 'review']) {
+      settingsStore.set(settings('account-a'));
+      journal.publish({...state, notes});
+      await mount(mode);
+      const quote = () => view.contentEl.querySelector('.weread-journal-quote');
+      const quoteId = () => quote().querySelector('.weread-journal-favorite')?.dataset.favoriteId;
+      const blacklist = () => quote().querySelector('.weread-journal-blacklist');
+      const inlineSwitch = root => root.querySelector('.weread-journal-article-toggle, [role="switch"], [aria-label="旧句重逢包含公众号"]');
+      check(!inlineSwitch(quote()) && !quote().textContent.includes('包含公众号'), mode + ': quote header has no duplicate inline article switch');
+      check(settingsStore.current().journalIncludeArticles === undefined, mode + ': opening existing settings does not reset the saved article preference');
+      check(blacklist()?.getAttribute('aria-label') === '加入旧句重逢黑名单' && blacklist().textContent.trim() === '' && blacklist().querySelector('svg[data-icon="ban"]'), mode + ': blacklist is an accessible icon-only ban action');
+      check(blacklist().title.includes('山间的阅读') && blacklist().title.includes('划线'), mode + ': blacklist tooltip identifies the current book and its highlights');
+      const stale = blacklist();
+      settingsStore.actions.setJournalExcludedBookIds(['already-excluded']);
+      const firstId = quoteId();
+      const notesBefore = JSON.stringify(state.notes), favoritesBefore = JSON.stringify(favoriteState);
+      const loadsBefore = journalLoads, callsBefore = apiCalls, writesBefore = favoriteWrites;
+      const actionStart = settingsStore.actionCalls.length;
+      stale.click(); await tick();
+      check(firstId?.startsWith('a:') && !quoteId()?.startsWith('a:'), mode + ': blacklist immediately removes the current book with multiple quotes');
+      check(JSON.stringify(settingsStore.current().journalExcludedBookIds) === JSON.stringify(['already-excluded', 'a']), mode + ': blacklist action appends to the latest existing excluded IDs');
+      check(settingsStore.actionCalls[actionStart]?.[0] === 'journalExcludedBookIds', mode + ': blacklist uses the existing persisted settings action');
+      const replacementId = quoteId(), callsAfterBlacklist = settingsStore.actionCalls.length;
+      stale.click(); await tick();
+      check(quoteId() === replacementId && settingsStore.actionCalls.length === callsAfterBlacklist, mode + ': detached stale blacklist cannot blacklist the replacement book');
+      for (let i = 0; i < 6; i++) {
+        click('换一句', quote());
+        check(!quoteId()?.startsWith('a:'), mode + ': same-book shuffle never restores any blacklisted quote ' + i);
+        click('换一本', quote());
+        check(!quoteId()?.startsWith('a:'), mode + ': other-book shuffle never restores a blacklisted book ' + i);
+      }
+      settingsStore.actions.setJournalExcludedBookIds(['already-excluded', 'a', 'b', 'mp']);
+      check(quote().classList.contains('is-empty') && !quoteId() && blacklist().disabled && [...quote().querySelectorAll('button')].filter(button => ['换一句', '换一本'].includes(button.textContent)).every(button => button.disabled), mode + ': all blocked renders the compact empty state and disables blacklist and shuffle actions');
+      settingsStore.actions.setJournalExcludedBookIds(['already-excluded', 'b', 'mp']);
+      check(quoteId()?.startsWith('a:') && !blacklist().disabled, mode + ': restoring via existing excluded settings restores the whole book');
+      settingsStore.actions.setJournalExcludedBookIds(['a', 'b']);
+      check(quoteId()?.startsWith('mp:'), mode + ': article-only eligibility deterministically selects a channel quote');
+      blacklist().click(); await tick();
+      check(!quoteId() && JSON.stringify(settingsStore.current().journalExcludedBookIds) === JSON.stringify(['a', 'b', 'mp']), mode + ': blacklisting a channel excludes all of its article quotes');
+      settingsStore.actions.setJournalExcludedBookIds(['a', 'b']);
+      check(quoteId()?.startsWith('mp:'), mode + ': restoring a channel restores article quotes');
+      settingsStore.actions.setJournalIncludeArticles(false); await tick();
+      check(settingsStore.current().journalIncludeArticles === false && !quoteId() && !inlineSwitch(quote()), mode + ': disabling articles in global settings immediately removes a current channel quote');
+      check(settingsStore.saved().journalIncludeArticles === false && settingsStore.current().saveArticleToggle === true, mode + ': article preference is persisted independently of article sync');
+      check(journalLoads === loadsBefore && apiCalls === callsBefore && favoriteWrites === writesBefore && JSON.stringify(state.notes) === notesBefore, mode + ': blacklist, restoration and global article setting do not reload or mutate journal, call APIs or write favorites');
+      settingsStore.set(settings('account-a'));
+      settingsStore.reload(); await mount(mode);
+      check(settingsStore.current().journalIncludeArticles === false && !inlineSwitch(quote()) && !quoteId() && JSON.stringify(settingsStore.current().journalExcludedBookIds) === JSON.stringify(['a', 'b']), mode + ': mocked saved settings retain exclusions and article choice in a newly opened panel');
+      settingsStore.actions.setJournalIncludeArticles(true); await tick();
+      check(settingsStore.current().journalIncludeArticles === true && quoteId()?.startsWith('mp:'), mode + ': enabling articles in global settings restores channel eligibility deterministically');
+      const peer = new WereadJournalView({}, plugin, journal, api, mode === 'today' ? 'review' : 'today');
+      await peer.onOpen(); await tick();
+      const peerQuote = () => peer.contentEl.querySelector('.weread-journal-quote');
+      check(peerQuote().querySelector('article'), mode + ': peer panel opens with the saved included article policy');
+      settingsStore.actions.setJournalIncludeArticles(false); await tick();
+      check(!inlineSwitch(quote()) && !inlineSwitch(peerQuote()) && !quoteId() && !peerQuote().querySelector('article'), mode + ': global article setting updates Today and Review current quotes together without inline switches');
+      await peer.onClose(); peer.contentEl.remove();
+      settingsStore.actions.setJournalExcludedBookIds([]);
+      for (let i = 0; i < 8; i++) {
+        click('换一句', quote()); check(!quoteId()?.startsWith('mp:'), mode + ': article-disabled same-book shuffle stays ordinary ' + i);
+        click('换一本', quote()); check(!quoteId()?.startsWith('mp:'), mode + ': article-disabled other-book shuffle stays ordinary ' + i);
+      }
+      const retained = view.contentEl.querySelector(mode === 'review' ? '.weread-journal-day-notes' : '.weread-journal-today-notes');
+      let search, calendarHtml, resultHtml;
+      if (mode === 'review') {
+        search = view.contentEl.querySelector('input[type=search]');
+        search.value = 'ARTICLE SENTINEL'; search.dispatchEvent(new Event('input'));
+        search = view.contentEl.querySelector('input[type=search]'); search.focus();
+        resultHtml = view.contentEl.querySelector('.weread-journal-day-notes').innerHTML;
+        calendarHtml = view.contentEl.querySelector('.weread-journal-calendar').innerHTML;
+        check(resultHtml.includes('ARTICLE SENTINEL'), 'Review: disabled article quotes remain searchable in the full cached journal');
+      }
+      const preservedResults = view.contentEl.querySelector(mode === 'review' ? '.weread-journal-day-notes' : '.weread-journal-today-notes');
+      settingsStore.actions.setJournalIncludeArticles(true);
+      settingsStore.actions.setJournalIncludeArticles(false);
+      check(preservedResults.isConnected && (mode !== 'today' || retained === preservedResults), mode + ': global article setting changes replace only the quote and retain ordinary note DOM');
+      if (mode === 'review') check(search.isConnected && document.activeElement === search && search.value === 'ARTICLE SENTINEL' && preservedResults.innerHTML === resultHtml && view.contentEl.querySelector('.weread-journal-calendar').innerHTML === calendarHtml, 'Review: global article setting preserves focused search, complete article results and calendar counts');
+      check(JSON.stringify(state.notes) === notesBefore && JSON.stringify(favoriteState) === favoritesBefore && favoriteWrites === writesBefore, mode + ': quote controls never mutate cached notes or favorites');
+      // The peer and new panel openings legitimately load once; setting actions and shuffles do not.
+      const loadsAfterMounts = journalLoads, callsAfterMounts = apiCalls;
+      settingsStore.actions.setJournalIncludeArticles(false);
+      journal.publish({...state, notes: [...notes]}); await tick();
+      check(!quoteId()?.startsWith('mp:'), mode + ': cache reload publications respect article exclusion');
+      check(journalLoads === loadsAfterMounts && apiCalls === callsAfterMounts, mode + ': quote settings and cache publications never initiate upstream pulls');
+      check(loadsAfterMounts === loadsBefore + 2 && callsAfterMounts === callsBefore + 2, mode + ': only explicit fixture panel opens load journal and Today shelf/stat APIs');
+      settingsStore.set(settings('account-a'));
+    }
+    journal.publish({...state, notes: baseNotes});
+    await view.onClose(); view.contentEl.remove(); view = undefined;
+    return assertions.length - assertionStart;
+  },
+  async scrollNotesSetup() {
+    const many = Array.from({length: 400}, (_, i) => note('scroll-' + i, 'a', i % 2 ? 'thought' : 'highlight', 'SCROLL FIXTURE ' + i + ' 阅读让每一天留下清晰的痕迹。', '2026-11-06T03:00:00Z'));
+    journal.publish({...state, notes: [...many, ...baseNotes.filter(entry => entry.createTime < RealDate.parse('2026-11-05T16:00:00Z'))], syncing: false});
+    await mount('review');
+    const list = document.querySelector('.weread-journal-day-list');
+    check(list.getAttribute('role') === 'region' && list.tabIndex === 0 && list.getAttribute('aria-label') === '2026-11-06 · 笔记', 'Review day list is a keyboard-focusable region labelled by the selected date');
+    check(list.querySelectorAll('article').length === 100 && list.scrollHeight > list.clientHeight * 5, '400-note day keeps pagination inside a genuinely overflowing list');
+    check(list.clientHeight > 100 && list.clientHeight <= innerHeight * .65 + 1, 'Review note list height is bounded by the current viewport');
+    const style = getComputedStyle(list);
+    check(style.overflowY === 'auto' && style.overscrollBehaviorY === 'contain', 'Review list scrolls locally and contains overscroll');
+    check(!list.querySelector('h2, .weread-journal-calendar, .weread-journal-controls') && list.previousElementSibling.tagName === 'H2', 'Date heading, calendar and search controls remain outside the scrolling list');
+    check(document.documentElement.scrollHeight < 2400 && document.documentElement.scrollWidth <= innerWidth && list.scrollWidth <= list.clientWidth, 'Hundreds of notes do not create a huge outer page or horizontal overflow');
+    if (innerWidth <= 400) check(list.getBoundingClientRect().top >= document.querySelector('.weread-journal-calendar').getBoundingClientRect().bottom, 'Mobile keeps the compact calendar above the bounded list');
+    list.scrollIntoView({block: 'center'}); list.focus({preventScroll: true});
+    window.scrollTestOuterY = scrollY;
+  },
+  async scrollNotesAfterKey() {
+    let list = document.querySelector('.weread-journal-day-list');
+    check(list.scrollTop > 0 && Math.abs(scrollY - window.scrollTestOuterY) < 2, 'PageDown scrolls the focused notes region without scrolling the outer page');
+    list.scrollTop = 240;
+    const before = list.scrollTop;
+    const loads = journalLoads, calls = apiCalls;
+    journal.publish({...state, syncing: true}); await tick();
+    list = document.querySelector('.weread-journal-day-list');
+    check(list.scrollTop === before && document.activeElement === list, 'Background progress preserves inner scroll and focused region across rerenders');
+    journal.publish({...state, notes: [...state.notes], syncing: false}); await tick();
+    list = document.querySelector('.weread-journal-day-list');
+    check(list.scrollTop === before, 'Async cache completion preserves inner scroll');
+    favorites.publish(); await tick();
+    check(document.querySelector('.weread-journal-day-list') === list && list.scrollTop === before, 'Favorite updates preserve the list DOM and inner scroll');
+    settingsStore.actions.setJournalExcludedBookIds(['a']);
+    check(document.querySelector('.weread-journal-day-list') === list && list.scrollTop === before, 'Quote exclusion updates preserve inner scroll');
+    settingsStore.actions.setJournalExcludedBookIds([]);
+    check(!document.querySelector('.weread-journal-article-toggle'), 'Review has no inline article switch');
+    settingsStore.actions.setJournalIncludeArticles(false);
+    check(document.querySelector('.weread-journal-day-list') === list && list.scrollTop === before && document.activeElement === list, 'Global article setting preserves Review list DOM, inner scroll and focused region');
+    settingsStore.actions.setJournalIncludeArticles(true);
+    check(document.querySelector('.weread-journal-day-list') === list && list.scrollTop === before && document.activeElement === list, 'Re-enabling articles preserves the same focused Review reading position');
+    const activateDetail = plugin.activateBookDetailView;
+    plugin.activateBookDetailView = async () => { view.contentEl.hidden = true; };
+    list.querySelector('.weread-journal-source').click(); await tick();
+    view.contentEl.hidden = false; plugin.activateBookDetailView = activateDetail;
+    check(document.querySelector('.weread-journal-day-list') === list && list.scrollTop === before, 'Opening a source book and returning to the retained Review DOM preserves inner scroll');
+    list.scrollTop = list.scrollHeight;
+    const pageScroll = list.scrollTop;
+    click('再看 100 条', list); await tick();
+    list = document.querySelector('.weread-journal-day-list');
+    check(list.querySelectorAll('article').length === 200 && list.scrollTop === pageScroll, 'Loading the next page retains the previous inner reading position');
+    click('刷新笔记', view.contentEl); await tick();
+    journal.publish({...state, notes: [...state.notes]}); await tick();
+    list = document.querySelector('.weread-journal-day-list');
+    check(list.scrollTop === pageScroll, 'Explicit refresh and subsequent cache publish preserve the current list position');
+    const filter = document.querySelector('.weread-journal-controls select'); filter.value = 'thought'; filter.dispatchEvent(new Event('change'));
+    list = document.querySelector('.weread-journal-day-list');
+    check(list.scrollTop === 0 && list.querySelectorAll('article').length === 100 && [...list.querySelectorAll('article')].every(card => card.classList.contains('is-thought')), 'Kind changes reset scroll and pagination for the new results');
+    list.scrollTop = 200;
+    const search = document.querySelector('input[type=search]'); search.value = 'SCROLL FIXTURE'; search.dispatchEvent(new Event('input'));
+    list = document.querySelector('.weread-journal-day-list');
+    check(list.scrollTop === 0 && list.getAttribute('aria-label') === '搜索全部已缓存笔记', 'Search changes reset inner scroll and update the accessible region label');
+    search.value = ''; search.dispatchEvent(new Event('input'));
+    document.querySelector('.weread-journal-controls select').value = 'all'; document.querySelector('.weread-journal-controls select').dispatchEvent(new Event('change'));
+    list = document.querySelector('.weread-journal-day-list'); list.scrollTop = 200;
+    document.querySelector('button[aria-label^="2026-11-05，"]').click();
+    list = document.querySelector('.weread-journal-day-list');
+    check(list.scrollTop === 0 && list.getAttribute('aria-label') === '2026-11-05 · 笔记' && list.querySelectorAll('article').length === 2, 'Changing the selected date starts its notes at the top');
+    document.querySelector('button[aria-label^="2026-11-06，"]').click();
+    list = document.querySelector('.weread-journal-day-list'); list.scrollTop = 200;
+    const month = document.querySelector('input[type=month]'); month.value = '2026-10'; month.dispatchEvent(new Event('change'));
+    list = document.querySelector('.weread-journal-day-list');
+    check(list.scrollTop === 0 && !list.querySelector('article') && list.textContent.includes('这个范围内还没有笔记') && list.clientHeight < 100, 'Empty selected day resets scroll and does not reserve an oversized blank region');
+    click('回到今天');
+    check(document.querySelector('.weread-journal-day-list').querySelectorAll('article').length === 100, 'Returning to today restores its first page of notes');
+    check(apiCalls === calls && journalLoads === loads + 1, 'Scrolling, local filters and pagination need no API calls or journal loads beyond explicit refresh');
+    await mount('today');
+    const today = document.querySelector('.weread-journal-today-notes');
+    check(!document.querySelector('.weread-journal-day-list') && getComputedStyle(today).maxHeight === 'none' && getComputedStyle(today).overflowY === 'visible', 'Today notes retain their existing unbounded layout');
+    journal.publish({...state, notes: baseNotes});
+    await view.onClose(); view.contentEl.remove(); view = undefined;
+  },
+  async behavior() {
+    const many = Array.from({length: 105}, (_, i) => note('page-' + i, 'a', 'thought', 'PAGE FIXTURE ' + i, '2026-11-06T03:00:00Z'));
+    journal.publish({ ...state, notes: many, syncing: false });
+    let search = document.querySelector('input[type=search]'); search.value = 'PAGE FIXTURE'; search.dispatchEvent(new Event('input'));
+    check(cards(results()).length === 100, 'Search initially bounds rendered notes to 100');
+    click('再看 5 条'); check(cards(results()).length === 105, 'Show more renders remaining notes');
+    journal.publish({ ...state, notes: baseNotes, failedBooks: 0, error: '' });
+    const oldShelf = gate(); const oldStats = gate();
+    let account = 'old';
+    const accountApi = {
+      async getShelf() { return account === 'old' ? oldShelf.promise : { books: [{ bookId: 'new', title: 'New account book', readUpdateTime: NOW / 1000 }] }; },
+      async getReadingStats() { return account === 'old' ? oldStats.promise : { readTimes: { [NOW / 1000]: 120 } }; }
+    };
+    await mount('today', journal, accountApi);
+    account = 'new'; settingsStore.set(settings('account-b')); await tick();
+    oldShelf.resolve({ books: [{bookId: 'old', title: 'OLD ACCOUNT SENTINEL', readUpdateTime: NOW / 1000}] });
+    oldStats.resolve({ readTimes: { [NOW / 1000]: 9 * 3600 } }); await tick();
+    check(document.body.textContent.includes('New account book') && !document.body.textContent.includes('OLD ACCOUNT SENTINEL'), 'Late old-account shelf response is ignored');
+    check(document.querySelector('.weread-journal-summary').textContent.includes('0小时2分钟'), 'Late old-account reading stats are ignored');
+    await view.onClose(); view.contentEl.remove(); view = undefined;
+    check(intervals.size === 0 && listeners.size === 0 && settingsStore.listenerCount() === 0, 'Close removes timer and journal/settings subscriptions');
+    const hydration = gate();
+    const slowCache = { ...journal, load: () => hydration.promise };
+    view = new WereadJournalView({}, plugin, slowCache, accountApi, 'today');
+    const opening = view.onOpen(); await tick(); await view.onClose(); hydration.resolve(state); await opening;
+    check(intervals.size === 0 && listeners.size === 0 && settingsStore.listenerCount() === 0, 'Close during hydration cannot install later timer or subscriptions');
+    view.contentEl.remove(); view = undefined;
+    return assertions;
+  }
+};
+`;
+
+async function browserBundle() {
+	const output = await build({
+		stdin: { contents: fixture, resolveDir: process.cwd(), loader: 'ts' },
+		bundle: true,
+		platform: 'browser',
+		format: 'iife',
+		write: false,
+		plugins: [
+			{
+				name: 'journal-view-fixtures',
+				setup(builder) {
+					builder.onResolve({ filter: /^obsidian$/ }, () => ({
+						path: 'obsidian',
+						namespace: 'mock'
+					}));
+					builder.onResolve({ filter: /^electron$/ }, () => ({
+						path: 'electron',
+						namespace: 'mock'
+					}));
+					builder.onResolve({ filter: /(?:^|\/)settings$/ }, () => ({
+						path: 'settings',
+						namespace: 'mock'
+					}));
+					builder.onLoad({ filter: /.*/, namespace: 'mock' }, ({ path: name }) => ({
+						contents:
+							name === 'obsidian'
+								? `export const Platform = {isDesktopApp: true}; export class Component { constructor() { this.children = new Set(); } addChild(child) { this.children.add(child); return child; } removeChild(child) { if (this.children.delete(child)) child.onunload?.(); return child; } } export class ItemView extends Component { constructor() { super(); this.contentEl = document.createElement('main'); document.body.append(this.contentEl); } } export class Notice { constructor(text) { (window.journalNotices ||= []).push(text); } } export function setIcon(element, name) { const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg'); svg.setAttribute('data-icon', name); svg.setAttribute('class', 'svg-icon'); svg.setAttribute('width', '24'); svg.setAttribute('height', '24'); svg.setAttribute('viewBox', '0 0 24 24'); svg.setAttribute('fill', 'none'); svg.setAttribute('stroke', 'currentColor'); svg.setAttribute('stroke-width', '2'); const path = document.createElementNS(svg.namespaceURI, 'path'); path.setAttribute('d', name === 'star' ? 'm12 3 2.8 5.7 6.3.9-4.5 4.4 1.1 6.2-5.7-3-5.7 3 1.1-6.2L3.2 9.6l6.3-.9Z' : name === 'refresh-cw' ? 'M3 11a9 9 0 0 1 15.4-6.4L21 7 M21 3v4h-4 M21 13a9 9 0 0 1-15.4 6.4L3 17 M3 21v-4h4' : name === 'copy' ? 'M9 9h12v12H9z M5 15H3V3h12v2' : 'M15 3h6v6 M10 14 21 3 M21 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h6'); svg.append(path); element.append(svg); } export class WorkspaceLeaf {}`
+								: name === 'electron'
+									? `export const shell = {async openExternal(url) { window.journalExternalOpens.push(url); }};`
+									: `let value, persisted; const listeners = new Set(), actionCalls = []; const set = (next) => { value = next; for (const fn of listeners) fn(value); }; const save = (key, next) => { actionCalls.push([key, structuredClone(next)]); persisted = structuredClone({...value, [key]: next}); set(structuredClone(persisted)); }; export const settingsStore = { subscribe(fn) { listeners.add(fn); fn(value); return () => listeners.delete(fn); }, set, current: () => value, reload() { set(structuredClone(persisted)); }, saved: () => structuredClone(persisted), actionCalls, actions: { setJournalExcludedBookIds(ids) { save('journalExcludedBookIds', ids); }, setJournalIncludeArticles(include) { save('journalIncludeArticles', include); }, setFavoritesViewMode(mode) { save('favoritesViewMode', mode); } }, listenerCount: () => listeners.size };`
+					}));
+					builder.onLoad({ filter: /\.css$/ }, async ({ path: filename }) => ({
+						contents: `const style = document.createElement('style'); style.textContent = ${JSON.stringify(await readFile(filename, 'utf8'))}; document.head.append(style);`,
+						loader: 'js'
+					}));
+				}
+			}
+		]
+	});
+	return output.outputFiles[0].text;
+}
+
+function cdpClient(chrome) {
+	let id = 0;
+	let buffer = '';
+	const pending = new Map();
+	chrome.stdio[4].on('data', (chunk) => {
+		buffer += chunk.toString();
+		for (;;) {
+			const delimiter = buffer.indexOf('\0');
+			if (delimiter < 0) break;
+			const message = JSON.parse(buffer.slice(0, delimiter));
+			buffer = buffer.slice(delimiter + 1);
+			const request = pending.get(message.id);
+			if (!request) continue;
+			pending.delete(message.id);
+			clearTimeout(request.timer);
+			if (message.error) request.reject(new Error(JSON.stringify(message.error)));
+			else request.resolve(message.result);
+		}
+	});
+	return (method, params = {}, sessionId) =>
+		new Promise((resolve, reject) => {
+			const requestId = ++id;
+			const timer = setTimeout(() => {
+				pending.delete(requestId);
+				reject(new Error(`CDP timeout: ${method}`));
+			}, 15000);
+			pending.set(requestId, { resolve, reject, timer });
+			chrome.stdio[3].write(
+				JSON.stringify({
+					id: requestId,
+					method,
+					params,
+					...(sessionId ? { sessionId } : {})
+				}) + '\0'
+			);
+		});
+}
+
+test(
+	'production Today and Review views work in Chrome with local fixtures',
+	{ skip: !available, timeout: 60000 },
+	async (t) => {
+		const directory = await mkdtemp(path.join(tmpdir(), 'journal-view-chrome-'));
+		const chrome = spawn(
+			chromeBin,
+			[
+				'--headless=new',
+				'--disable-gpu',
+				'--no-first-run',
+				'--no-default-browser-check',
+				'--disable-background-networking',
+				'--remote-debugging-pipe',
+				`--user-data-dir=${directory}`,
+				'about:blank'
+			],
+			{ stdio: ['ignore', 'ignore', 'pipe', 'pipe', 'pipe'] }
+		);
+		let chromeErrors = '';
+		chrome.stderr.on('data', (chunk) => {
+			chromeErrors += chunk.toString();
+		});
+		const exited = new Promise((resolve) => chrome.once('exit', resolve));
+		t.after(async () => {
+			chrome.kill('SIGTERM');
+			await Promise.race([exited, new Promise((resolve) => setTimeout(resolve, 2000))]);
+			if (chrome.exitCode === null && chrome.signalCode === null) {
+				chrome.kill('SIGKILL');
+				await exited;
+			}
+			const resolved = path.resolve(directory);
+			assert.equal(path.dirname(resolved), path.resolve(tmpdir()));
+			assert(path.basename(resolved).startsWith('journal-view-chrome-'));
+			// Chromium helpers may finish profile writes just after the browser exits.
+			await rm(resolved, { recursive: true, force: true, maxRetries: 5, retryDelay: 150 });
+		});
+		const cdp = cdpClient(chrome);
+		let sessionId;
+		try {
+			const target = await cdp('Target.createTarget', { url: 'about:blank' });
+			({ sessionId } = await cdp('Target.attachToTarget', {
+				targetId: target.targetId,
+				flatten: true
+			}));
+		} catch (error) {
+			throw new Error(`${error.message}\n${chromeErrors}`);
+		}
+		const send = (method, params) => cdp(method, params, sessionId);
+		await send('Page.enable');
+		await send('Runtime.enable');
+		await send('Network.enable');
+		await send('Network.setBlockedURLs', { urls: ['http://*', 'https://*'] });
+		await send('Emulation.setTimezoneOverride', { timezoneId: 'Asia/Shanghai' });
+		await send('Emulation.setDeviceMetricsOverride', {
+			width: 1180,
+			height: 1000,
+			deviceScaleFactor: 1,
+			mobile: false
+		});
+		// No page/resource is fetched: all markup comes from the actual production view.
+		await send('Page.setDocumentContent', {
+			frameId: (await send('Page.getFrameTree')).frameTree.frame.id,
+			html: '<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"></head><body></body></html>'
+		});
+		const evaluate = async (expression) => {
+			const result = await send('Runtime.evaluate', {
+				expression,
+				awaitPromise: true,
+				returnByValue: true
+			});
+			if (result.exceptionDetails)
+				throw new Error(
+					result.exceptionDetails.exception?.description || result.exceptionDetails.text
+				);
+			return result.result.value;
+		};
+		await evaluate(await browserBundle());
+		await evaluate(
+			`(() => { const style = document.createElement('style'); style.textContent = 'body { margin: 0; padding: 24px; font-family: -apple-system, BlinkMacSystemFont, sans-serif; background: #f8f7f4; color: #292d29; --background-primary: #fff; --background-secondary: #f3f1ec; --background-modifier-border: #dddcd5; --text-normal: #292d29; --text-muted: #72756d; --interactive-accent: #5f765c; } main { max-width: 1050px; margin: auto; } button, input, select { font: inherit; padding: 7px 11px; border: 1px solid #d8d9d0; background: #fff; border-radius: 6px; color: inherit; } button { cursor: pointer; } button.mod-cta { background: #e0e8d9; } button:disabled { opacity: .45; }'; document.head.append(style); })()`
+		);
+		// Minimal native Obsidian app.css tablet rule, extracted read-only during the
+		// WebKit reproduction. Keep its specificity: simplified mobile CSS misses this bug.
+		await evaluate(
+			`(() => { const style = document.createElement('style'); style.textContent = '.is-tablet button:not(.clickable-icon) { padding: 4px 20px; }'; document.head.append(style); })()`
+		);
+		for (const surface of ['journal', 'favorites']) {
+			await evaluate(
+				surface === 'journal' ? 'smoke.iconSetup()' : 'smoke.favoritesPreview("cards")'
+			);
+			const selectors =
+				surface === 'journal'
+					? [
+							'.weread-journal-refresh',
+							'.weread-journal-note-actions button',
+							'.weread-journal-sort',
+							'.weread-journal-note-actions a'
+						]
+					: ['.weread-favorites-toolbar-icon', '.weread-favorites-action:has(svg)'];
+			for (const [mode, width, classes] of [
+				['desktop', 1024, ''],
+				['phone', 390, 'is-mobile is-phone is-ios'],
+				['tablet-wide', 1024, 'is-mobile is-tablet is-ios'],
+				['tablet-narrow', 768, 'is-mobile is-tablet is-ios']
+			]) {
+				await send('Emulation.setDeviceMetricsOverride', {
+					width,
+					height: 1366,
+					deviceScaleFactor: 1,
+					mobile: mode !== 'desktop'
+				});
+				await evaluate(`document.body.className = ${JSON.stringify(classes)}`);
+				await t.test(`${surface} ${mode} icon SVGs fit usable button content`, async () => {
+					const geometry = await evaluate(
+						`smoke.iconGeometry(${JSON.stringify(selectors)})`
+					);
+					assert(
+						geometry.every(
+							(icon) =>
+								icon.width >= 12 &&
+								icon.height >= 12 &&
+								icon.contentWidth >= icon.width - 1 &&
+								icon.fits
+						),
+						JSON.stringify(geometry)
+					);
+				});
+			}
+		}
+		await evaluate('smoke.iconCleanup()');
+		t.diagnostic(
+			`${await evaluate('smoke.importProgress()')} cumulative assertions after incremental import regression`
+		);
+		await evaluate('document.body.className = ""');
+		await send('Emulation.setDeviceMetricsOverride', {
+			width: 1180,
+			height: 1000,
+			deviceScaleFactor: 1,
+			mobile: false
+		});
+		await evaluate('smoke.noteSorting()');
+		t.diagnostic(
+			`${await evaluate('smoke.anniversaryYears()')} focused anniversary year-group assertions passed`
+		);
+		await evaluate('smoke.calendarHeatmap()');
+		await send('Input.dispatchKeyEvent', {
+			type: 'keyDown',
+			key: 'Enter',
+			code: 'Enter',
+			text: '\r',
+			unmodifiedText: '\r',
+			windowsVirtualKeyCode: 13
+		});
+		await send('Input.dispatchKeyEvent', {
+			type: 'keyUp',
+			key: 'Enter',
+			code: 'Enter',
+			windowsVirtualKeyCode: 13
+		});
+		await evaluate('smoke.calendarAfterKeyboard()');
+		await evaluate('smoke.originalNavigation()');
+		await evaluate('smoke.today()');
+		await evaluate(
+			'Promise.all([...document.images].map(image => image.decode().catch(() => {})))'
+		);
+		let screenshot = await send('Page.captureScreenshot', {
+			format: 'png',
+			captureBeyondViewport: true
+		});
+		await writeFile('/tmp/obsidian-weread-today.png', Buffer.from(screenshot.data, 'base64'));
+		await evaluate('smoke.review()');
+		await evaluate('smoke.layout()');
+		screenshot = await send('Page.captureScreenshot', {
+			format: 'png',
+			captureBeyondViewport: true
+		});
+		await writeFile('/tmp/obsidian-weread-review.png', Buffer.from(screenshot.data, 'base64'));
+		await evaluate('document.querySelector("main").style.width = "500px"');
+		assert(
+			await evaluate(
+				'document.querySelector(".weread-journal-calendar").getBoundingClientRect().width <= 261 && document.querySelector(".weread-journal-day-notes").getBoundingClientRect().top >= document.querySelector(".weread-journal-calendar").getBoundingClientRect().bottom'
+			),
+			'Narrow pane stacks the compact calendar inside a wide window'
+		);
+		await evaluate('document.querySelector("main").style.width = ""');
+		await send('Emulation.setDeviceMetricsOverride', {
+			width: 390,
+			height: 844,
+			deviceScaleFactor: 1,
+			mobile: true
+		});
+		assert(
+			await evaluate('document.documentElement.scrollWidth <= 390'),
+			'Review fits narrow viewport: ' +
+				JSON.stringify(
+					await evaluate(
+						'({width:innerWidth,scroll:document.documentElement.scrollWidth,overflow:[...document.querySelectorAll("*")].filter(e=>e.getBoundingClientRect().right>390).slice(0,8).map(e=>({tag:e.tagName,cls:e.className,right:e.getBoundingClientRect().right}))})'
+					)
+				)
+		);
+		assert(
+			await evaluate(
+				'document.querySelector(".weread-journal-calendar").getBoundingClientRect().width <= 261 && document.querySelector(".weread-journal-day-notes").getBoundingClientRect().top >= document.querySelector(".weread-journal-calendar").getBoundingClientRect().bottom'
+			),
+			'Mobile retains a compact calendar above notes'
+		);
+		screenshot = await send('Page.captureScreenshot', {
+			format: 'png',
+			captureBeyondViewport: true
+		});
+		await writeFile(
+			'/tmp/obsidian-weread-review-mobile.png',
+			Buffer.from(screenshot.data, 'base64')
+		);
+		await evaluate('smoke.today()');
+		assert(
+			await evaluate('document.documentElement.scrollWidth <= 390'),
+			'Today fits narrow viewport'
+		);
+		assert.equal(
+			await evaluate(
+				'getComputedStyle(document.querySelector(".weread-journal-summary")).gridTemplateColumns.split(" ").length'
+			),
+			1,
+			'Today summary stacks on narrow screens'
+		);
+		await evaluate(
+			'Promise.all([...document.images].map(image => image.decode().catch(() => {})))'
+		);
+		screenshot = await send('Page.captureScreenshot', {
+			format: 'png',
+			captureBeyondViewport: true
+		});
+		await writeFile(
+			'/tmp/obsidian-weread-today-mobile.png',
+			Buffer.from(screenshot.data, 'base64')
+		);
+		await evaluate('smoke.review()');
+		await evaluate('smoke.behavior()');
+		await evaluate('smoke.exclusions()');
+		t.diagnostic(
+			`${await evaluate('smoke.reencounterControls()')} focused reencounter control assertions passed`
+		);
+		for (const width of [1180, 375]) {
+			await send('Emulation.setDeviceMetricsOverride', {
+				width,
+				height: width === 375 ? 667 : 1000,
+				deviceScaleFactor: 1,
+				mobile: width === 375
+			});
+			await evaluate('smoke.scrollNotesSetup()');
+			await send('Input.dispatchKeyEvent', {
+				type: 'keyDown',
+				key: 'PageDown',
+				code: 'PageDown',
+				windowsVirtualKeyCode: 34
+			});
+			await send('Input.dispatchKeyEvent', {
+				type: 'keyUp',
+				key: 'PageDown',
+				code: 'PageDown',
+				windowsVirtualKeyCode: 34
+			});
+			await evaluate('new Promise(resolve => setTimeout(resolve, 180))');
+			await evaluate('smoke.scrollNotesAfterKey()');
+		}
+		const assertions = await evaluate('smoke.favorites()');
+		assert(assertions.length >= 20);
+		await send('Emulation.setDeviceMetricsOverride', {
+			width: 1180,
+			height: 1000,
+			deviceScaleFactor: 1,
+			mobile: false
+		});
+		await evaluate('smoke.favoritesPreview("cards")');
+		await evaluate(
+			'Promise.all([...document.images].map(image => image.decode().catch(() => {})))'
+		);
+		screenshot = await send('Page.captureScreenshot', {
+			format: 'png',
+			captureBeyondViewport: true
+		});
+		await writeFile(
+			'/tmp/obsidian-weread-favorites.png',
+			Buffer.from(screenshot.data, 'base64')
+		);
+		await send('Emulation.setDeviceMetricsOverride', {
+			width: 390,
+			height: 844,
+			deviceScaleFactor: 1,
+			mobile: true
+		});
+		await evaluate('smoke.favoritesPreview("list")');
+		screenshot = await send('Page.captureScreenshot', {
+			format: 'png',
+			captureBeyondViewport: true
+		});
+		await writeFile(
+			'/tmp/obsidian-weread-favorites-mobile.png',
+			Buffer.from(screenshot.data, 'base64')
+		);
+		await evaluate('smoke.closeFavoritesPreview()');
+		t.diagnostic(
+			`${await evaluate('smoke.assertions.length')} browser assertions passed; screenshots: /tmp/obsidian-weread-today.png, /tmp/obsidian-weread-review.png, /tmp/obsidian-weread-favorites.png, /tmp/obsidian-weread-favorites-mobile.png`
+		);
+	}
+);
